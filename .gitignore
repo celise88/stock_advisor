@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+
+.env
+schwab_token.json
+data/*.jsonl
+data/*.json
+
+.DS_Store

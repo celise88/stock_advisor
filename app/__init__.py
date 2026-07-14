@@ -1,0 +1,2 @@
+"""Stock Advisor application package."""
+

@@ -1,0 +1,76 @@
+# stock_advisor
+
+Stock Advisor is a FastAPI + Plotly application for beginner day traders, combining scanner discovery, fundamentals, technical interpretation, charting, quote/trading, and trade journaling.
+
+## Current Features
+
+### Scanner
+- Continuous background scan (default 45s, configurable).
+- Configurable criteria from UI/API:
+  - minimum market cap,
+  - minimum average volume,
+  - minimum relative volume.
+- UI displays only currently passing symbols.
+- Scanner rows include:
+  - price,
+  - checks,
+  - day move ($/%),
+  - trigger time (`Triggered At`).
+
+### Symbol Workspace - Fundamentals
+- Current price and key fundamentals (ownership/short metrics, margins, volume stats, 52-week range, etc.).
+- Next earnings date, recent 8-K filings, news, and sentiment.
+- Data-source warning/degradation messaging when needed.
+
+### Symbol Workspace - Technicals
+- Indicator cards with beginner-focused interpretation.
+- Holistic interpretation rows:
+  - `Action Bias` (with `Risk Mode`),
+  - `Holistic Read`,
+  - `Regime Filter (ADX)`.
+- Holistic output integrates:
+  - trend/momentum alignment,
+  - conflict detection,
+  - session/day performance context,
+  - relative-volume conviction adjustments.
+- Dynamic Fibonacci interpretations based on current context.
+
+### Intraday Chart
+- 5m / 15m candles with days-back control.
+- Pre/post-market bars muted.
+- Bollinger + VWAP overlays.
+- Candle hover interpretation details.
+- Structural signals shown in technical signal list.
+- Days-back is clipped to trading sessions (`days=1` => one session).
+
+### Quote, Trading, Journal
+- Schwab-first quote endpoint with fallback behavior.
+- Order submission endpoint (market/limit + optional stop-loss/take-profit).
+- Dry-run support.
+- Broker sync endpoint for pending order reconciliation.
+- Trade journal + performance summaries.
+
+## Setup
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Run
+```bash
+uvicorn app.main:app --reload
+```
+
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
+
+## Schwab Token Setup (if needed)
+```bash
+python init_schwab_token.py
+```
+
+## Notes
+- Free-tier APIs can rate-limit and return partial fields.
+- Scanner universe and defaults live in `app/config.py`.
+- Trade/order logs are written as JSONL under `data/`.
+- For Yahoo certificate issues on macOS, set `DISABLE_YFINANCE=true` in `.env`.
