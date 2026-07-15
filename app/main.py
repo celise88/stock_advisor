@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,6 +46,240 @@ def _clean_symbol(raw_symbol: str) -> str:
     cleaned = (raw_symbol or "").upper().strip()
     cleaned = cleaned.replace(",", "").replace(";", "")
     return cleaned
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _order_timestamp(order_payload: Dict[str, Any]) -> datetime:
+    for key in ("closeTime", "enteredTime", "releaseTime", "requestedDestination"):
+        raw = order_payload.get(key)
+        if not raw or not isinstance(raw, str):
+            continue
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _order_id(order_payload: Dict[str, Any]) -> Optional[str]:
+    raw = order_payload.get("orderId")
+    if raw is None:
+        raw = order_payload.get("id")
+    if raw is None:
+        return None
+    return str(raw)
+
+
+def _parse_filled_events(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        summary = SchwabClient.summarize_order(order)
+        status = str(summary.get("status") or "").upper()
+        if status not in {"FILLED", "EXECUTED"}:
+            continue
+        symbol = summary.get("symbol")
+        side = summary.get("side")
+        fill_price = _safe_float(summary.get("averageFillPrice"))
+        qty = _safe_float(summary.get("filledQuantity")) or _safe_float(summary.get("quantity"))
+        order_id = _order_id(order)
+        if not symbol or side not in {"BUY", "SELL"} or fill_price is None or qty is None or qty <= 0 or not order_id:
+            continue
+        events.append(
+            {
+                "order_id": order_id,
+                "symbol": str(symbol).upper(),
+                "side": side,
+                "qty": float(qty),
+                "price": float(fill_price),
+                "status": status,
+                "timestamp": _order_timestamp(order),
+                "raw": order,
+            }
+        )
+    events.sort(key=lambda row: (row["timestamp"], row["order_id"]))
+    return events
+
+
+def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
+    events = _parse_filled_events(orders)
+    if not events:
+        return {
+            "fetchedFilledOrders": 0,
+            "loggedOrders": 0,
+            "importedClosedTrades": 0,
+            "skippedExistingTrades": 0,
+            "openUnmatchedLots": 0,
+        }
+
+    existing_trades = journal.trades()
+    existing_trade_keys = set()
+    existing_trade_broker_ids = set()
+    for trade in existing_trades:
+        notes = str(trade.get("notes") or "")
+        marker = "broker_import_key="
+        if marker in notes:
+            existing_trade_keys.add(notes.split(marker, 1)[1].split(";", 1)[0].strip())
+        exit_marker = "exit_order_id="
+        if exit_marker in notes:
+            existing_trade_broker_ids.add(notes.split(exit_marker, 1)[1].split(";", 1)[0].strip())
+        broker_id = trade.get("broker_order_id")
+        if broker_id:
+            existing_trade_broker_ids.add(str(broker_id))
+
+    existing_order_ids = set()
+    for record in journal.orders():
+        if not isinstance(record, dict):
+            continue
+        broker_id = record.get("broker_order_id")
+        if broker_id:
+            existing_order_ids.add(str(broker_id))
+
+    logged_orders = 0
+    for event in events:
+        if event["order_id"] in existing_order_ids:
+            continue
+        journal.log_order_attempt(
+            {
+                "source": "broker_import",
+                "broker_order_id": event["order_id"],
+                "symbol": event["symbol"],
+                "side": event["side"],
+                "quantity": int(round(event["qty"])),
+                "fill_price": event["price"],
+                "broker_status": event["status"],
+                "filled_at": event["timestamp"].isoformat(),
+            }
+        )
+        existing_order_ids.add(event["order_id"])
+        logged_orders += 1
+
+    # Ignore fills already tied to existing tracked trades to avoid duplicates.
+    importable_events = [e for e in events if e["order_id"] not in existing_trade_broker_ids]
+
+    long_lots: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    short_lots: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    matches: List[Dict[str, Any]] = []
+
+    def _consume_match(
+        entry_side: str,
+        entry_lots: Dict[str, List[Dict[str, Any]]],
+        exit_event: Dict[str, Any],
+        symbol: str,
+        qty_to_match: float,
+    ) -> float:
+        remaining = qty_to_match
+        lots = entry_lots[symbol]
+        while remaining > 0 and lots:
+            lot = lots[0]
+            matched_qty = min(remaining, lot["qty_remaining"])
+            lot["qty_remaining"] -= matched_qty
+            remaining -= matched_qty
+            lot["match_seq"] += 1
+
+            matches.append(
+                {
+                    "entry_order_id": lot["order_id"],
+                    "exit_order_id": exit_event["order_id"],
+                    "symbol": symbol,
+                    "entry_side": entry_side,
+                    "entry_price": lot["price"],
+                    "exit_price": exit_event["price"],
+                    "qty": matched_qty,
+                    "entry_ts": lot["timestamp"],
+                    "exit_ts": exit_event["timestamp"],
+                    "segment": lot["match_seq"],
+                }
+            )
+
+            if lot["qty_remaining"] <= 1e-9:
+                lots.pop(0)
+        return remaining
+
+    for event in importable_events:
+        symbol = event["symbol"]
+        if event["side"] == "BUY":
+            remaining = _consume_match("SELL", short_lots, event, symbol, event["qty"])
+            if remaining > 1e-9:
+                long_lots[symbol].append(
+                    {
+                        "order_id": event["order_id"],
+                        "timestamp": event["timestamp"],
+                        "price": event["price"],
+                        "qty_remaining": remaining,
+                        "match_seq": 0,
+                    }
+                )
+        else:  # SELL
+            remaining = _consume_match("BUY", long_lots, event, symbol, event["qty"])
+            if remaining > 1e-9:
+                short_lots[symbol].append(
+                    {
+                        "order_id": event["order_id"],
+                        "timestamp": event["timestamp"],
+                        "price": event["price"],
+                        "qty_remaining": remaining,
+                        "match_seq": 0,
+                    }
+                )
+
+    imported_closed = 0
+    skipped_existing = 0
+    for match in matches:
+        qty_int = max(1, int(round(match["qty"])))
+        import_key = (
+            f"{match['entry_order_id']}:{match['exit_order_id']}:"
+            f"{qty_int}:{match['entry_side']}:{match['segment']}"
+        )
+        if import_key in existing_trade_keys:
+            skipped_existing += 1
+            continue
+
+        opened = journal.log_open_trade(
+            symbol=match["symbol"],
+            side=match["entry_side"],
+            quantity=qty_int,
+            entry_price=float(match["entry_price"]),
+            strategy="broker_import",
+            order_id=f"broker_import:{import_key}",
+            status="open",
+            broker_order_id=match["entry_order_id"],
+            broker_status="FILLED",
+        )
+        journal.close_trade(
+            trade_id=opened["trade_id"],
+            exit_price=float(match["exit_price"]),
+            notes=(
+                f"Imported from Schwab fills; "
+                f"broker_import_key={import_key}; "
+                f"exit_order_id={match['exit_order_id']}"
+            ),
+        )
+        existing_trade_keys.add(import_key)
+        imported_closed += 1
+
+    unmatched = 0
+    for lots in long_lots.values():
+        unmatched += len([l for l in lots if l.get("qty_remaining", 0) > 1e-9])
+    for lots in short_lots.values():
+        unmatched += len([l for l in lots if l.get("qty_remaining", 0) > 1e-9])
+
+    return {
+        "fetchedFilledOrders": len(events),
+        "loggedOrders": logged_orders,
+        "importedClosedTrades": imported_closed,
+        "skippedExistingTrades": skipped_existing,
+        "openUnmatchedLots": unmatched,
+    }
 
 
 if STATIC_DIR.exists():
@@ -269,6 +504,9 @@ def place_order(req: OrderRequest):
             "strategy": req.strategy,
             "orderType": req.order_type,
             "dryRun": req.dry_run,
+            "broker_order_id": None,
+            "broker_status": None,
+            "broker_error": None,
             "payload": payload,
         }
     )
@@ -284,6 +522,13 @@ def place_order(req: OrderRequest):
             strategy=req.strategy,
             order_id=logged["id"],
         )
+        journal.log_order_result(
+            order_log_id=logged["id"],
+            broker_order_id=None,
+            broker_status="SIMULATED",
+            broker_error=None,
+            payload={"reason": "dry_run=true or Schwab unavailable"},
+        )
         return {
             "status": "simulated",
             "orderLogId": logged["id"],
@@ -293,6 +538,13 @@ def place_order(req: OrderRequest):
 
     try:
         result = schwab.place_order(payload)
+        journal.log_order_result(
+            order_log_id=logged["id"],
+            broker_order_id=str(result.get("orderId")) if result.get("orderId") is not None else None,
+            broker_status=str(result.get("status", "SUBMITTED")).upper(),
+            broker_error=None,
+            payload={"http_status": result.get("http_status"), "location": result.get("location")},
+        )
         pending = journal.log_pending_trade(
             symbol=symbol,
             side=side,
@@ -305,6 +557,12 @@ def place_order(req: OrderRequest):
         )
         return {"status": "submitted", "broker": result, "trade": pending}
     except Exception as exc:
+        journal.log_order_result(
+            order_log_id=logged["id"],
+            broker_order_id=None,
+            broker_status="ERROR",
+            broker_error=str(exc),
+        )
         raise HTTPException(status_code=500, detail=f"Order submission failed: {exc}")
 
 
@@ -359,11 +617,25 @@ def sync_trades():
         except Exception as exc:
             errors.append({"trade_id": trade_id, "error": str(exc)})
 
+    history_import = {
+        "fetchedFilledOrders": 0,
+        "loggedOrders": 0,
+        "importedClosedTrades": 0,
+        "skippedExistingTrades": 0,
+        "openUnmatchedLots": 0,
+    }
+    try:
+        recent_orders = schwab.get_recent_orders()
+        history_import = _import_broker_history(recent_orders)
+    except Exception as exc:
+        errors.append({"trade_id": "broker_history_import", "error": str(exc)})
+
     return {
         "status": "ok",
         "checked": len(journal.pending_trades()),
         "updates": updates,
         "errors": errors,
+        "historyImport": history_import,
     }
 
 

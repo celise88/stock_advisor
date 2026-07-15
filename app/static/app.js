@@ -396,8 +396,10 @@ async function syncTrades() {
     const result = await api("/api/trades/sync", { method: "POST" });
     const updateCount = (result.updates || []).length;
     const errorCount = (result.errors || []).length;
+    const importedCount = Number(result.historyImport?.importedClosedTrades || 0);
+    const loggedOrderCount = Number(result.historyImport?.loggedOrders || 0);
     document.getElementById("trade-result").textContent =
-      `Sync complete. Updates: ${updateCount}, Errors: ${errorCount}`;
+      `Sync complete. Updates: ${updateCount}, Imported closed trades: ${importedCount}, Imported orders: ${loggedOrderCount}, Errors: ${errorCount}`;
     await loadJournal();
   } catch (err) {
     document.getElementById("trade-result").textContent = `Sync failed: ${err.message}`;

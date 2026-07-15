@@ -8,7 +8,6 @@ from typing import Any, Dict, List
 
 from .config import DATA_DIR
 
-
 TRADES_FILE = DATA_DIR / "trades.jsonl"
 ORDERS_FILE = DATA_DIR / "orders.jsonl"
 
@@ -22,6 +21,7 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
+
     rows: List[Dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -42,6 +42,28 @@ class TradeJournal:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             **payload,
         }
+        _append_jsonl(ORDERS_FILE, record)
+        return record
+
+    def log_order_result(
+        self,
+        order_log_id: str,
+        broker_order_id: str | None = None,
+        broker_status: str | None = None,
+        broker_error: str | None = None,
+        payload: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        record: Dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": "broker_result",
+            "order_log_id": order_log_id,
+            "broker_order_id": broker_order_id,
+            "broker_status": broker_status,
+            "broker_error": broker_error,
+        }
+        if payload:
+            record.update(payload)
         _append_jsonl(ORDERS_FILE, record)
         return record
 
@@ -118,6 +140,7 @@ class TradeJournal:
         current = self._latest_trade_state(trade_id)
         if not current:
             raise ValueError(f"Trade {trade_id} not found")
+
         updated = {
             **current,
             "status": "open",
@@ -131,6 +154,7 @@ class TradeJournal:
         current = self._latest_trade_state(trade_id)
         if not current:
             raise ValueError(f"Trade {trade_id} not found")
+
         updated = {
             **current,
             "status": "canceled",
@@ -148,6 +172,7 @@ class TradeJournal:
         current = self._latest_trade_state(trade_id)
         if not current:
             raise ValueError(f"Trade {trade_id} not found")
+
         updated = {
             **current,
             "broker_status": broker_status,
@@ -193,6 +218,7 @@ class TradeJournal:
             if not trade_id:
                 continue
             latest[trade_id] = event
+
         rows = list(latest.values())
         rows.sort(
             key=lambda r: (
@@ -207,6 +233,18 @@ class TradeJournal:
 
     def pending_trades(self) -> List[Dict[str, Any]]:
         return [t for t in self.trades() if t.get("status") == "pending"]
+
+    def broker_sync_candidates(self) -> List[Dict[str, Any]]:
+        candidates = []
+        for trade in self.trades():
+            status = str(trade.get("status") or "").lower()
+            broker_order_id = trade.get("broker_order_id")
+            if status == "pending":
+                candidates.append(trade)
+                continue
+            if broker_order_id and status in {"open", "closed"}:
+                candidates.append(trade)
+        return candidates
 
     def orders(self) -> List[Dict[str, Any]]:
         return _read_jsonl(ORDERS_FILE)

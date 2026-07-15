@@ -117,11 +117,13 @@ class SchwabClient:
             raise RuntimeError("No access token present in Schwab token file.")
         return access
 
-    def _headers(self) -> Dict[str, str]:
-        return {
+    def _headers(self, method: str = "GET") -> Dict[str, str]:
+        headers = {
             "Authorization": f"Bearer {self._access_token()}",
-            "Content-Type": "application/json",
         }
+        if method.upper() == "POST":
+            headers["Content-Type"] = "application/json"
+        return headers
 
     def _get_sdk_client(self):
         if self._sdk_client is not None:
@@ -143,6 +145,28 @@ class SchwabClient:
     def _resolve_account_hash(self) -> str:
         if self._account_hash:
             return self._account_hash
+
+        sdk = self._get_sdk_client()
+        if sdk is not None:
+            try:
+                resp = sdk.get_account_numbers()
+                if getattr(resp, "status_code", None) == 200:
+                    accounts = resp.json()
+                    if isinstance(accounts, list) and accounts:
+                        configured = SETTINGS.schwab_account_id.replace("-", "")
+                        chosen = accounts[0]
+                        if configured:
+                            for acct in accounts:
+                                if str(acct.get("accountNumber", "")).replace("-", "") == configured:
+                                    chosen = acct
+                                    break
+                        hash_value = chosen.get("hashValue")
+                        if hash_value:
+                            self._account_hash = hash_value
+                            return hash_value
+            except Exception:
+                pass
+
         url = f"{self.BASE_URL}/trader/v1/accounts/accountNumbers"
         resp = self.session.get(url, headers=self._headers(), timeout=15)
         if resp.status_code != 200:
@@ -201,10 +225,10 @@ class SchwabClient:
         resp = self.session.get(url, headers=self._headers(), params=params, timeout=10)
         if resp.status_code != 200:
             params = {"symbols": symbol}
-            resp = self.session.get(url, headers=self._headers(), params=params, timeout=10)
+            resp = self.session.get(url, headers=self._headers(method="GET"), params=params, timeout=10)
         if resp.status_code != 200:
             url2 = f"{self.BASE_URL}/marketdata/v1/{symbol}/quotes"
-            resp = self.session.get(url2, headers=self._headers(), timeout=10)
+            resp = self.session.get(url2, headers=self._headers(method="GET"), timeout=10)
         if resp.status_code != 200:
             detail = resp.text.strip() if hasattr(resp, "text") and resp.text else "(empty body)"
             raise RuntimeError(
@@ -240,7 +264,7 @@ class SchwabClient:
 
         url = f"{self.BASE_URL}/marketdata/v1/instruments"
         params = {"symbol": symbol, "projection": "fundamental"}
-        resp = self.session.get(url, headers=self._headers(), params=params, timeout=12)
+        resp = self.session.get(url, headers=self._headers(method="GET"), params=params, timeout=12)
         if resp.status_code != 200:
             detail = resp.text.strip() if hasattr(resp, "text") and resp.text else "(empty body)"
             raise RuntimeError(
@@ -366,7 +390,7 @@ class SchwabClient:
                 "needExtendedHoursData": str(bool(need_extended_hours_data)).lower(),
                 "needPreviousClose": "false",
             }
-            resp = self.session.get(url, headers=self._headers(), params=params, timeout=15)
+            resp = self.session.get(url, headers=self._headers(method="GET"), params=params, timeout=15)
         if resp.status_code != 200:
             detail = resp.text.strip() if hasattr(resp, "text") and resp.text else "(empty body)"
             raise RuntimeError(
@@ -381,7 +405,7 @@ class SchwabClient:
     def place_order(self, order: Dict[str, Any]) -> Dict[str, Any]:
         account_hash = self._resolve_account_hash()
         url = f"{self.BASE_URL}/trader/v1/accounts/{account_hash}/orders"
-        resp = self.session.post(url, headers=self._headers(), json=order, timeout=15)
+        resp = self.session.post(url, headers=self._headers(method="POST"), json=order, timeout=15)
         if resp.status_code not in (200, 201):
             raise RuntimeError(f"Order rejected: HTTP {resp.status_code} {resp.text}")
         location = resp.headers.get("Location") or resp.headers.get("location")
@@ -405,13 +429,34 @@ class SchwabClient:
     def get_order(self, order_id: str) -> Dict[str, Any]:
         account_hash = self._resolve_account_hash()
         url = f"{self.BASE_URL}/trader/v1/accounts/{account_hash}/orders/{order_id}"
-        resp = self.session.get(url, headers=self._headers(), timeout=15)
+        resp = self.session.get(url, headers=self._headers(method="GET"), timeout=15)
         if resp.status_code != 200:
             raise RuntimeError(f"Order lookup failed: HTTP {resp.status_code} {resp.text}")
         payload = resp.json()
         if not isinstance(payload, dict):
             raise RuntimeError("Unexpected Schwab order payload type.")
         return payload
+
+    def get_recent_orders(self) -> List[Dict[str, Any]]:
+        account_hash = self._resolve_account_hash()
+        url = f"{self.BASE_URL}/trader/v1/accounts/{account_hash}/orders"
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(days=30)
+        params = {
+            "fromEnteredTime": start.strftime("%Y-%m-%dT%H:%M:%S%z")[:-5] + "Z",
+            "toEnteredTime": now.strftime("%Y-%m-%dT%H:%M:%S%z")[:-5] + "Z",
+        }
+        resp = self.session.get(url, headers=self._headers(method="GET"), params=params, timeout=15)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Order history fetch failed: HTTP {resp.status_code} {resp.text}")
+        payload = resp.json()
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            orders = payload.get("orders")
+            if isinstance(orders, list):
+                return [item for item in orders if isinstance(item, dict)]
+        return []
 
     @staticmethod
     def summarize_order(order_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -442,8 +487,53 @@ class SchwabClient:
                         average_fill_price = sum(prices) / len(prices)
                     break
 
+        symbol = None
+        side = None
+        quantity = None
+        legs = order_payload.get("orderLegCollection")
+        if isinstance(legs, list):
+            for leg in legs:
+                if not isinstance(leg, dict):
+                    continue
+                instrument = leg.get("instrument")
+                if isinstance(instrument, dict):
+                    symbol_value = instrument.get("symbol") or leg.get("symbol")
+                    if symbol_value:
+                        symbol = str(symbol_value).upper()
+                instruction = str(leg.get("instruction") or "").upper()
+                if not side and instruction:
+                    if instruction in {"BUY", "BUY_TO_COVER"}:
+                        side = "BUY"
+                    elif instruction in {"SELL", "SELL_SHORT", "SELL_TO_COVER"}:
+                        side = "SELL"
+                leg_quantity = leg.get("quantity")
+                if quantity is None:
+                    if isinstance(leg_quantity, (int, float)) and not isinstance(leg_quantity, bool):
+                        quantity = int(leg_quantity)
+                    elif isinstance(leg_quantity, str):
+                        try:
+                            quantity = int(float(leg_quantity))
+                        except ValueError:
+                            quantity = None
+                if symbol or side or quantity is not None:
+                    break
+
+        if quantity is None and isinstance(order_payload.get("quantity"), (int, float)):
+            quantity = int(order_payload.get("quantity"))
+
+        if side is None:
+            side_value = order_payload.get("side") or order_payload.get("instruction")
+            side_text = str(side_value or "").upper()
+            if side_text in {"BUY", "BUY_TO_COVER"}:
+                side = "BUY"
+            elif side_text in {"SELL", "SELL_SHORT", "SELL_TO_COVER"}:
+                side = "SELL"
+
         return {
             "status": status,
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
             "filledQuantity": float(filled_qty) if isinstance(filled_qty, (int, float)) else None,
             "remainingQuantity": float(remaining_qty) if isinstance(remaining_qty, (int, float)) else None,
             "averageFillPrice": average_fill_price,
