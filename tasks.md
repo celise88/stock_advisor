@@ -64,12 +64,18 @@ Legend:
 - [x] Schwab-first quote endpoint with fallback.
 - [x] Order placement endpoint and dry-run path.
 - [x] Pending-order sync/reconciliation endpoint.
+- [x] Broker outcome logging in order ledger (`broker_order_id`, `broker_status`, `broker_error`).
+- [x] Broker history import on sync:
+  - [x] ingest recent Schwab filled/executed orders,
+  - [x] backfill order records,
+  - [x] derive closed trades from matched entry/exit fills.
 - [x] Trade close endpoint.
 - [x] Journal and performance APIs + UI.
 
 ## Cleanup
-- [x] Removed all `.ipynb` files from repository.
+- [x] Removed legacy experimental `.ipynb` notebooks from repository.
+- [ ] Optional: remove local ad-hoc `tests.ipynb` when no longer needed.
 
 ## Open Follow-ups
 - [ ] Optional: persist runtime scanner criteria updates back to `.env`.
-- [ ] Optional: improve order-placement error diagnostics in UI for broker-side failures.
+- [ ] Optional: surface latest `broker_error` entries directly in Journal UI.

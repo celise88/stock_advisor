@@ -98,7 +98,12 @@ Trading:
 
 Lifecycle + journal:
 - order attempt logging,
+- order outcome logging linked to attempts (`broker_order_id`, `broker_status`, `broker_error`),
 - pending order sync/reconciliation to filled/canceled states,
+- broker history import on sync:
+  - fetch recent filled/executed Schwab orders,
+  - record broker order events,
+  - derive closed trades by matching entry/exit fills (FIFO by symbol),
 - manual trade close endpoint,
 - journal + performance endpoints/cards.
 

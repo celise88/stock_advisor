@@ -48,7 +48,14 @@ Stock Advisor is a FastAPI + Plotly application for beginner day traders, combin
 - Order submission endpoint (market/limit + optional stop-loss/take-profit).
 - Dry-run support.
 - Broker sync endpoint for pending order reconciliation.
+- Broker history import during sync:
+  - fetches recent Schwab filled/executed orders,
+  - backfills broker order records,
+  - creates closed journal trades from matched entry/exit fills.
 - Trade journal + performance summaries.
+- `orders.jsonl` logs both:
+  - order attempts,
+  - linked broker outcomes (`broker_order_id`, `broker_status`, `broker_error`).
 
 ## Setup
 ```bash
@@ -73,4 +80,5 @@ python init_schwab_token.py
 - Free-tier APIs can rate-limit and return partial fields.
 - Scanner universe and defaults live in `app/config.py`.
 - Trade/order logs are written as JSONL under `data/`.
+- To ingest external Schwab executions into Journal/Performance, run trade sync (`POST /api/trades/sync` or use the UI Sync button).
 - For Yahoo certificate issues on macOS, set `DISABLE_YFINANCE=true` in `.env`.

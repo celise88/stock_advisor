@@ -59,7 +59,12 @@ Maintain a production-minded MVP for beginner day traders with:
 
 ### Phase 6 - Journal + Performance (Complete)
 - Order attempts and trade state logging.
+- Broker order-result/error logging linked to order attempts.
 - Pending-order broker sync endpoint.
+- Broker history import during sync:
+  - fetches recent filled/executed Schwab orders,
+  - logs broker order records to `orders.jsonl`,
+  - pairs entry/exit fills (FIFO by symbol) into closed journal trades.
 - Trade close endpoint.
 - Performance summary metrics and UI.
 
@@ -72,3 +77,4 @@ Maintain a production-minded MVP for beginner day traders with:
 - Scanner and technical interpretation are tuned for educational readability first.
 - External API quality/rate limits can still affect freshness/completeness.
 - Schwab integration requires valid local token setup and account permissions.
+- Journal/performance reflects app-submitted trades and broker-history imports after `/api/trades/sync`.
