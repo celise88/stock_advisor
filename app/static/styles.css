@@ -145,6 +145,34 @@ th {
   gap: 8px;
 }
 
+.stream-diag-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.stream-diag-grid .diag-item {
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.stream-diag-grid .diag-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.stream-diag-grid .diag-value {
+  margin-top: 4px;
+  font-weight: 600;
+}
+
+.stream-error {
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
 .card {
   background: var(--panel-soft);
   border: 1px solid var(--line);

@@ -3,12 +3,14 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from dateutil import parser as date_parser
 
 from .analytics import (
     add_indicators,
@@ -24,6 +26,7 @@ from .models import FundamentalsResponse, OrderRequest, OutcomeRequest, Technica
 from .providers import EdgarProvider, FinnhubProvider, MarketDataProvider
 from .scanner import ScannerService
 from .schwab_client import SchwabClient
+from .streaming_service import SchwabStreamService
 
 
 app = FastAPI(title=SETTINGS.app_name, version="0.1.0")
@@ -35,7 +38,8 @@ app.add_middleware(
 )
 
 schwab = SchwabClient()
-market_provider = MarketDataProvider(schwab_client=schwab)
+stream_service = SchwabStreamService(schwab_client=schwab, seed_symbols=SETTINGS.scanner_symbols)
+market_provider = MarketDataProvider(schwab_client=schwab, stream_service=stream_service)
 finnhub_provider = FinnhubProvider()
 edgar_provider = EdgarProvider()
 scanner_service = ScannerService(market_provider)
@@ -58,14 +62,39 @@ def _safe_float(value: Any) -> Optional[float]:
 
 
 def _order_timestamp(order_payload: Dict[str, Any]) -> datetime:
-    for key in ("closeTime", "enteredTime", "releaseTime", "requestedDestination"):
-        raw = order_payload.get(key)
-        if not raw or not isinstance(raw, str):
-            continue
+    def _parse(raw: Any) -> Optional[datetime]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            value = float(raw)
+            if value <= 0:
+                return None
+            if value > 10_000_000_000:
+                value = value / 1000.0
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        if not isinstance(raw, str):
+            return None
+        text = raw.strip()
+        if not text:
+            return None
+        if re.search(r"[+-]\d{4}$", text):
+            text = f"{text[:-5]}{text[-5:-2]}:{text[-2:]}"
+        text = text.replace("Z", "+00:00")
         try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(text)
         except ValueError:
-            continue
+            try:
+                parsed = date_parser.parse(text)
+            except Exception:
+                return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    for key in ("closeTime", "enteredTime", "releaseTime", "transactionTime"):
+        parsed = _parse(order_payload.get(key))
+        if parsed is not None:
+            return parsed
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
@@ -118,17 +147,21 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
             "loggedOrders": 0,
             "importedClosedTrades": 0,
             "skippedExistingTrades": 0,
+            "backfilledTradeTimestamps": 0,
             "openUnmatchedLots": 0,
         }
 
     existing_trades = journal.trades()
     existing_trade_keys = set()
+    existing_trade_by_key: Dict[str, Dict[str, Any]] = {}
     existing_trade_broker_ids = set()
     for trade in existing_trades:
         notes = str(trade.get("notes") or "")
         marker = "broker_import_key="
         if marker in notes:
-            existing_trade_keys.add(notes.split(marker, 1)[1].split(";", 1)[0].strip())
+            import_key = notes.split(marker, 1)[1].split(";", 1)[0].strip()
+            existing_trade_keys.add(import_key)
+            existing_trade_by_key[import_key] = trade
         exit_marker = "exit_order_id="
         if exit_marker in notes:
             existing_trade_broker_ids.add(notes.split(exit_marker, 1)[1].split(";", 1)[0].strip())
@@ -234,13 +267,38 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     imported_closed = 0
     skipped_existing = 0
+    backfilled_timestamps = 0
+
+    def _to_iso(value: Any) -> Optional[str]:
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc).isoformat()
+            return value.astimezone(timezone.utc).isoformat()
+        if isinstance(value, str) and value:
+            return value
+        return None
+
     for match in matches:
         qty_int = max(1, int(round(match["qty"])))
         import_key = (
             f"{match['entry_order_id']}:{match['exit_order_id']}:"
             f"{qty_int}:{match['entry_side']}:{match['segment']}"
         )
+        entry_iso = _to_iso(match.get("entry_ts"))
+        exit_iso = _to_iso(match.get("exit_ts"))
         if import_key in existing_trade_keys:
+            existing = existing_trade_by_key.get(import_key)
+            if existing and existing.get("trade_id"):
+                if (
+                    (entry_iso and str(existing.get("opened_at") or "") != entry_iso)
+                    or (exit_iso and str(existing.get("closed_at") or "") != exit_iso)
+                ):
+                    journal.backfill_trade_times(
+                        trade_id=str(existing.get("trade_id")),
+                        opened_at=entry_iso,
+                        closed_at=exit_iso,
+                    )
+                    backfilled_timestamps += 1
             skipped_existing += 1
             continue
 
@@ -254,6 +312,7 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
             status="open",
             broker_order_id=match["entry_order_id"],
             broker_status="FILLED",
+            opened_at=entry_iso,
         )
         journal.close_trade(
             trade_id=opened["trade_id"],
@@ -263,8 +322,15 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
                 f"broker_import_key={import_key}; "
                 f"exit_order_id={match['exit_order_id']}"
             ),
+            closed_at=exit_iso,
         )
         existing_trade_keys.add(import_key)
+        existing_trade_by_key[import_key] = {
+            **opened,
+            "status": "closed",
+            "closed_at": exit_iso,
+            "opened_at": entry_iso or opened.get("opened_at"),
+        }
         imported_closed += 1
 
     unmatched = 0
@@ -278,6 +344,7 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         "loggedOrders": logged_orders,
         "importedClosedTrades": imported_closed,
         "skippedExistingTrades": skipped_existing,
+        "backfilledTradeTimestamps": backfilled_timestamps,
         "openUnmatchedLots": unmatched,
     }
 
@@ -288,6 +355,7 @@ if STATIC_DIR.exists():
 
 @app.on_event("startup")
 def startup() -> None:
+    stream_service.start()
     scanner_service.start()
     scanner_service.scan_once()
 
@@ -295,6 +363,7 @@ def startup() -> None:
 @app.on_event("shutdown")
 def shutdown() -> None:
     scanner_service.stop()
+    stream_service.stop()
 
 
 @app.get("/")
@@ -302,11 +371,19 @@ def index() -> FileResponse:
     index_path = STATIC_DIR / "index.html"
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="Frontend not found.")
-    return FileResponse(index_path)
+    return FileResponse(
+        index_path,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
+    stream_status = stream_service.status()
     return {
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -315,7 +392,24 @@ def health() -> Dict[str, Any]:
         "scannerAvgVolumeMin": scanner_service.avg_volume_min,
         "scannerRelativeVolumeMin": scanner_service.relative_volume_min,
         "schwabEnabled": schwab.enabled,
+        "schwabStreamEnabled": stream_status.get("enabled"),
+        "schwabStreamConnected": stream_status.get("connected"),
+        "schwabStreamLastError": stream_status.get("lastError"),
+        "schwabStreamLastMessageAgeSec": stream_status.get("lastMessageAgeSec"),
+        "schwabStreamTrackedSymbols": stream_status.get("trackedSymbols"),
     }
+
+
+@app.post("/api/stream/restart")
+def stream_restart() -> Dict[str, Any]:
+    if not schwab.enabled:
+        return {
+            "status": "skipped",
+            "reason": "Schwab not configured",
+            "stream": stream_service.status(),
+        }
+    status = stream_service.restart()
+    return {"status": "ok", "stream": status}
 
 
 @app.get("/api/scanner/results")
@@ -422,7 +516,13 @@ def technicals(
     data = add_indicators(history)
     fib = fibonacci_levels(data if not data.empty else history)
     signals = [s.__dict__ for s in detect_structure_signals(data)]
-    indicators = build_indicator_summary(data)
+    market_context = market_provider.advanced_market_context(
+        symbol=symbol,
+        interval=interval,
+        days=days,
+        history=history,
+    )
+    indicators = build_indicator_summary(data, market_context=market_context)
     indicators.extend(fibonacci_indicator_rows(data, fib))
     return TechnicalsResponse(
         symbol=symbol,
@@ -452,6 +552,10 @@ def chart(
 @app.get("/api/quote/{symbol}")
 def quote(symbol: str):
     symbol = _clean_symbol(symbol)
+
+    stream_quote = market_provider.streaming_quote(symbol)
+    if stream_quote:
+        return {"source": "schwab_stream", **stream_quote}
 
     def _fallback_quote(error_message: str):
         try:
@@ -622,6 +726,7 @@ def sync_trades():
         "loggedOrders": 0,
         "importedClosedTrades": 0,
         "skippedExistingTrades": 0,
+        "backfilledTradeTimestamps": 0,
         "openUnmatchedLots": 0,
     }
     try:

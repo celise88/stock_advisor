@@ -434,6 +434,468 @@ def _as_valid_float(value: Any) -> Optional[float]:
         return None
 
 
+def _indicator_row(key: str, value: Any, interpretation: str, explanation: str) -> Dict[str, Any]:
+    numeric_value = None
+    try:
+        if value is not None and not (isinstance(value, float) and math.isnan(value)):
+            numeric_value = float(value)
+    except Exception:
+        numeric_value = None
+    return {
+        "key": key,
+        "value": numeric_value,
+        "interpretation": interpretation,
+        "explanation": explanation,
+    }
+
+
+def _tick_rule_signs(close: pd.Series) -> pd.Series:
+    diff = close.diff()
+    signs = np.sign(diff).replace(0, np.nan).ffill().fillna(0.0)
+    return signs.astype(float)
+
+
+def _vpin_proxy(volume: pd.Series, signs: pd.Series, bucket_count: int = 24) -> Optional[float]:
+    if volume.empty or signs.empty or len(volume) < 25:
+        return None
+
+    vol = pd.to_numeric(volume, errors="coerce").fillna(0.0).astype(float)
+    sgn = pd.to_numeric(signs, errors="coerce").fillna(0.0).astype(float)
+    bucket_size = float(max(vol.tail(min(len(vol), 50)).mean() * 4.0, 1.0))
+    if bucket_size <= 0:
+        return None
+
+    imbalances: List[float] = []
+    bucket_buy = 0.0
+    bucket_sell = 0.0
+    bucket_fill = 0.0
+
+    for bar_volume, bar_sign in zip(vol.tolist(), sgn.tolist()):
+        if bar_volume <= 0:
+            continue
+        buy_remaining = bar_volume if bar_sign > 0 else (0.0 if bar_sign < 0 else bar_volume * 0.5)
+        sell_remaining = bar_volume - buy_remaining
+        volume_remaining = bar_volume
+
+        while volume_remaining > 1e-9:
+            capacity = max(bucket_size - bucket_fill, 0.0)
+            if capacity <= 1e-9:
+                imbalance = abs(bucket_buy - bucket_sell) / bucket_size
+                imbalances.append(float(min(max(imbalance, 0.0), 1.0)))
+                bucket_buy = 0.0
+                bucket_sell = 0.0
+                bucket_fill = 0.0
+                continue
+
+            take = min(volume_remaining, capacity)
+            ratio = take / volume_remaining if volume_remaining > 0 else 0.0
+            buy_take = buy_remaining * ratio
+            sell_take = sell_remaining * ratio
+
+            bucket_buy += buy_take
+            bucket_sell += sell_take
+            bucket_fill += take
+
+            buy_remaining -= buy_take
+            sell_remaining -= sell_take
+            volume_remaining -= take
+
+    if bucket_fill > 0:
+        imbalance = abs(bucket_buy - bucket_sell) / max(bucket_fill, 1.0)
+        imbalances.append(float(min(max(imbalance, 0.0), 1.0)))
+
+    if not imbalances:
+        return None
+    lookback = min(bucket_count, len(imbalances))
+    return float(np.mean(imbalances[-lookback:]))
+
+
+def _auction_pressure_proxies(data: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
+    if data.empty:
+        return None, None
+    try:
+        work = data.copy()
+        work["__ts"] = pd.to_datetime(work.index, utc=True, errors="coerce")
+        work = work.dropna(subset=["__ts"])
+        if work.empty:
+            return None, None
+
+        et = work["__ts"].dt.tz_convert("America/New_York")
+        work["__date"] = et.dt.date
+        work["__minutes"] = et.dt.hour * 60 + et.dt.minute
+        latest_date = work["__date"].iloc[-1]
+
+        day = work[work["__date"] == latest_date].copy()
+        if day.empty:
+            return None, None
+        rth = day[(day["__minutes"] >= 9 * 60 + 30) & (day["__minutes"] <= 16 * 60)]
+        if len(rth) < 3:
+            return None, None
+        premarket = day[(day["__minutes"] >= 4 * 60) & (day["__minutes"] < 9 * 60 + 30)]
+
+        open_bar = rth.iloc[0]
+        previous_dates = sorted([d for d in set(work["__date"].tolist()) if d < latest_date])
+        previous_close = None
+        if previous_dates:
+            prev_day = work[work["__date"] == previous_dates[-1]]
+            prev_rth = prev_day[(prev_day["__minutes"] >= 9 * 60 + 30) & (prev_day["__minutes"] <= 16 * 60)]
+            if not prev_rth.empty:
+                previous_close = _as_valid_float(prev_rth["Close"].iloc[-1])
+        if previous_close in (None, 0):
+            previous_close = _as_valid_float(premarket["Close"].iloc[-1]) if not premarket.empty else _as_valid_float(open_bar["Open"])
+
+        open_close = _as_valid_float(open_bar["Close"])
+        open_ref = previous_close
+        open_move_pct = ((open_close - open_ref) / open_ref * 100.0) if open_close is not None and open_ref not in (None, 0) else 0.0
+        pre_volume_ref = (
+            float(premarket["Volume"].mean())
+            if not premarket.empty and pd.notna(premarket["Volume"].mean())
+            else float(rth["Volume"].head(min(5, len(rth))).mean())
+        )
+        pre_volume_ref = max(pre_volume_ref, 1.0)
+        open_vol_ratio = float(open_bar.get("Volume", 0.0) or 0.0) / pre_volume_ref
+        open_range = max(float(open_bar.get("High", 0.0) or 0.0) - float(open_bar.get("Low", 0.0) or 0.0), 1e-9)
+        open_clv = ((float(open_bar["Close"]) - float(open_bar["Low"])) - (float(open_bar["High"]) - float(open_bar["Close"]))) / open_range
+        open_score = float(np.clip(math.tanh(open_move_pct / 1.5) * min(open_vol_ratio / 2.5, 2.0) + 0.25 * open_clv, -2.0, 2.0))
+
+        close_bar = rth.iloc[-1]
+        middle = rth.iloc[max(1, len(rth) // 3) : max(2, (2 * len(rth)) // 3)]
+        mid_vol_ref = float(middle["Volume"].mean()) if not middle.empty else float(rth["Volume"].mean())
+        mid_vol_ref = max(mid_vol_ref, 1.0)
+        close_vol_ratio = float(close_bar.get("Volume", 0.0) or 0.0) / mid_vol_ref
+        close_range = max(float(close_bar.get("High", 0.0) or 0.0) - float(close_bar.get("Low", 0.0) or 0.0), 1e-9)
+        close_clv = ((float(close_bar["Close"]) - float(close_bar["Low"])) - (float(close_bar["High"]) - float(close_bar["Close"]))) / close_range
+        close_score = float(np.clip(close_clv * min(close_vol_ratio / 2.0, 2.0), -2.0, 2.0))
+
+        return open_score, close_score
+    except Exception:
+        return None, None
+
+
+def _compute_advanced_flow_metrics(
+    data: pd.DataFrame,
+    market_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if data.empty:
+        return {
+            "ofi_ratio": None,
+            "vpin": None,
+            "aggressor_imbalance": None,
+            "opening_auction_score": None,
+            "closing_auction_score": None,
+            "stream_available": False,
+            "stream_note": "",
+            "stream_ofi_used": False,
+            "stream_vpin_used": False,
+            "stream_aggr_used": False,
+        }
+
+    volume = pd.to_numeric(data.get("Volume"), errors="coerce").fillna(0.0).astype(float)
+    close = pd.to_numeric(data.get("Close"), errors="coerce").astype(float)
+    high = pd.to_numeric(data.get("High"), errors="coerce").astype(float)
+    low = pd.to_numeric(data.get("Low"), errors="coerce").astype(float)
+
+    signs = _tick_rule_signs(close)
+    signed_volume = signs * volume
+    window = min(30, len(data))
+    total_window_vol = float(volume.tail(window).sum())
+    aggressor_imbalance = None
+    if total_window_vol > 0:
+        aggressor_imbalance = float(signed_volume.tail(window).sum() / total_window_vol)
+
+    spread_proxy = (high - low).abs()
+    min_spread = close.abs() * 0.0005
+    spread_proxy = spread_proxy.where(spread_proxy > min_spread, min_spread).fillna(min_spread).fillna(0.01)
+    bid = close - spread_proxy / 2.0
+    ask = close + spread_proxy / 2.0
+    buy_ratio = ((signs + 1.0) / 2.0).clip(lower=0.0, upper=1.0)
+    q_bid = volume * buy_ratio
+    q_ask = volume * (1.0 - buy_ratio)
+    bid_prev = bid.shift(1)
+    ask_prev = ask.shift(1)
+    q_bid_prev = q_bid.shift(1)
+    q_ask_prev = q_ask.shift(1)
+    event_flow = (
+        (bid >= bid_prev).astype(float) * q_bid
+        - (bid <= bid_prev).astype(float) * q_bid_prev
+        - (ask <= ask_prev).astype(float) * q_ask
+        + (ask >= ask_prev).astype(float) * q_ask_prev
+    ).fillna(0.0)
+    ofi_window = min(40, len(event_flow))
+    ofi_total = float(event_flow.tail(ofi_window).sum())
+    ofi_den = float(volume.tail(ofi_window).sum())
+    ofi_ratio = (ofi_total / ofi_den) if ofi_den > 0 else None
+
+    vpin = _vpin_proxy(volume, signs, bucket_count=24)
+    opening_auction_score, closing_auction_score = _auction_pressure_proxies(data)
+
+    streaming_ctx = market_context.get("streaming", {}) if isinstance(market_context, dict) else {}
+    stream_available = isinstance(streaming_ctx, dict) and bool(streaming_ctx.get("available"))
+    stream_ofi = _as_valid_float(streaming_ctx.get("ofi")) if stream_available else None
+    stream_aggr = _as_valid_float(streaming_ctx.get("aggressorImbalance")) if stream_available else None
+    stream_vpin = _as_valid_float(streaming_ctx.get("vpin")) if stream_available else None
+    stream_note = str(streaming_ctx.get("note") or "") if isinstance(streaming_ctx, dict) else ""
+
+    if stream_ofi is not None:
+        ofi_ratio = float(np.clip(stream_ofi, -1.0, 1.0))
+    if stream_aggr is not None:
+        aggressor_imbalance = float(np.clip(stream_aggr, -1.0, 1.0))
+    if stream_vpin is not None:
+        vpin = float(np.clip(stream_vpin, 0.0, 1.0))
+
+    return {
+        "ofi_ratio": ofi_ratio,
+        "vpin": vpin,
+        "aggressor_imbalance": aggressor_imbalance,
+        "opening_auction_score": opening_auction_score,
+        "closing_auction_score": closing_auction_score,
+        "stream_available": stream_available,
+        "stream_note": stream_note,
+        "stream_ofi_used": stream_ofi is not None,
+        "stream_vpin_used": stream_vpin is not None,
+        "stream_aggr_used": stream_aggr is not None,
+    }
+
+
+def _advanced_indicator_rows(data: pd.DataFrame, market_context: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    if data.empty:
+        return []
+    metrics = _compute_advanced_flow_metrics(data, market_context=market_context)
+    ofi_ratio = metrics["ofi_ratio"]
+    vpin = metrics["vpin"]
+    aggressor_imbalance = metrics["aggressor_imbalance"]
+    opening_auction_score = metrics["opening_auction_score"]
+    closing_auction_score = metrics["closing_auction_score"]
+    stream_available = bool(metrics["stream_available"])
+    stream_note = str(metrics["stream_note"] or "")
+    stream_ofi_used = bool(metrics["stream_ofi_used"])
+    stream_vpin_used = bool(metrics["stream_vpin_used"])
+    stream_aggr_used = bool(metrics["stream_aggr_used"])
+
+    rows: List[Dict[str, Any]] = []
+
+    if ofi_ratio is None:
+        ofi_interp = "OFI unavailable."
+        ofi_expl = "Not enough reliable bars to estimate order-book pressure."
+    elif ofi_ratio >= 0.12:
+        ofi_interp = "Buy-side order-flow imbalance is strong."
+        ofi_expl = (
+            "Cont-Kukanov-Stoikov style OFI is positive; prefer long setups "
+            "on pullbacks instead of chasing tops, and avoid fighting the tape."
+        )
+    elif ofi_ratio <= -0.12:
+        ofi_interp = "Sell-side order-flow imbalance is strong."
+        ofi_expl = (
+            "OFI is negative; prioritize short setups or stay flat until "
+            "price reclaims VWAP with volume."
+        )
+    else:
+        ofi_interp = "Order flow is balanced to mixed."
+        ofi_expl = "No clear OFI edge; reduce size and wait for a cleaner directional signal."
+    if stream_ofi_used:
+        ofi_expl = f"{ofi_expl} Source: live Schwab stream order book."
+    rows.append(_indicator_row("Order Flow Imbalance (OFI)", None if ofi_ratio is None else ofi_ratio * 100.0, ofi_interp, ofi_expl))
+
+    if vpin is None:
+        vpin_interp = "VPIN unavailable."
+        vpin_expl = "Not enough volume buckets to estimate informed-flow risk."
+    elif vpin >= 0.65:
+        vpin_interp = "High toxicity regime (VPIN elevated)."
+        vpin_expl = (
+            "High VPIN suggests informed flow may dominate; trade smaller, wait for confirmation, "
+            "and avoid impulsive entries in noisy spikes."
+        )
+    elif vpin >= 0.45:
+        vpin_interp = "Moderate toxicity regime."
+        vpin_expl = "Conditions are tradeable but fragile; tighten stops and require cleaner setups."
+    else:
+        vpin_interp = "Lower toxicity regime."
+        vpin_expl = "Flow looks more two-sided; standard risk is more reasonable if trend context agrees."
+    if stream_vpin_used:
+        vpin_expl = f"{vpin_expl} Source: real-time signed volume from Schwab stream."
+    rows.append(_indicator_row("VPIN (Volume-Synchronized PIN)", vpin, vpin_interp, vpin_expl))
+
+    if aggressor_imbalance is None:
+        aggr_interp = "Aggressor imbalance unavailable."
+        aggr_expl = "Insufficient signed-volume data to estimate who is lifting/hitting."
+    elif aggressor_imbalance >= 0.15:
+        aggr_interp = "Aggressive buyers are in control."
+        aggr_expl = "Tick-rule signing favors buyer-initiated flow; prefer buying pullbacks over shorting strength."
+    elif aggressor_imbalance <= -0.15:
+        aggr_interp = "Aggressive sellers are in control."
+        aggr_expl = "Tick-rule signing favors seller-initiated flow; avoid bottom-fishing until pressure fades."
+    else:
+        aggr_interp = "Aggressor flow is roughly balanced."
+        aggr_expl = "No dominant side; wait for breakout plus volume confirmation."
+    if stream_aggr_used:
+        aggr_expl = f"{aggr_expl} Source: live quote tape via Schwab stream."
+    rows.append(
+        _indicator_row(
+            "Aggressor Imbalance (Tick Rule, %)",
+            None if aggressor_imbalance is None else aggressor_imbalance * 100.0,
+            aggr_interp,
+            aggr_expl,
+        )
+    )
+
+    if opening_auction_score is None:
+        open_interp = "Opening auction pressure unavailable."
+        open_expl = "Opening cross data was insufficient; using standard intraday signals only."
+    elif opening_auction_score >= 0.5:
+        open_interp = "Opening auction proxy favors buy imbalance."
+        open_expl = "Strong open with supportive volume; look for first pullback long if VWAP holds."
+    elif opening_auction_score <= -0.5:
+        open_interp = "Opening auction proxy favors sell imbalance."
+        open_expl = "Weak open with heavy pressure; avoid early longs until reclaim/absorption appears."
+    else:
+        open_interp = "Opening auction proxy is neutral."
+        open_expl = "Opening cross looked balanced; let the first trend leg form before committing."
+    rows.append(_indicator_row("Auction Imbalance (Open Proxy)", opening_auction_score, open_interp, open_expl))
+
+    if closing_auction_score is None:
+        close_interp = "Closing auction pressure unavailable."
+        close_expl = "Closing cross data was insufficient for a reliable read."
+    elif closing_auction_score >= 0.5:
+        close_interp = "Closing auction proxy shows buy-side imbalance."
+        close_expl = "Late-session buyers dominated; bullish overnight continuation odds improve if no bad catalyst."
+    elif closing_auction_score <= -0.5:
+        close_interp = "Closing auction proxy shows sell-side imbalance."
+        close_expl = "Late-session sellers dominated; expect cautious next-open tone unless futures reverse."
+    else:
+        close_interp = "Closing auction proxy is balanced."
+        close_expl = "No strong late imbalance; rely more on broader trend and premarket context."
+    rows.append(_indicator_row("Auction Imbalance (Close Proxy)", closing_auction_score, close_interp, close_expl))
+
+    if stream_available and stream_note:
+        rows.append(
+            _indicator_row(
+                "Stream Data Status",
+                None,
+                "Streaming microstructure feed active.",
+                stream_note,
+            )
+        )
+
+    cross_asset = market_context.get("crossAsset", {}) if isinstance(market_context, dict) else {}
+    if isinstance(cross_asset, dict) and cross_asset.get("available"):
+        delta = _as_valid_float(cross_asset.get("leadDeltaPct"))
+        symbol_move = _as_valid_float(cross_asset.get("symbolPremarketMovePct"))
+        composite = _as_valid_float(cross_asset.get("compositeLeadMovePct"))
+        lead_state = str(cross_asset.get("leadState") or "aligned")
+        if lead_state == "lagging_upside":
+            x_interp = "Cross-asset leadership is bullish; symbol is lagging."
+            x_expl = "ES/NQ + sector are stronger than this name; watch for catch-up long only after intraday confirmation."
+        elif lead_state == "lagging_downside":
+            x_interp = "Cross-asset leadership is bearish; symbol is resisting."
+            x_expl = "Futures/sector are weaker than this name; avoid forcing shorts until relative weakness appears."
+        elif lead_state == "leading":
+            x_interp = "Symbol is leading cross-asset tone."
+            x_expl = "Name is moving ahead of futures/sector; momentum setups can work, but use tighter risk in case leadership fades."
+        else:
+            x_interp = "Symbol is aligned with cross-asset tone."
+            x_expl = "Premarket move is consistent with ES/NQ/sector direction; prioritize setups in the same direction."
+        if symbol_move is not None and composite is not None:
+            x_expl = (
+                f"{x_expl} Premarket: symbol {symbol_move:+.2f}% vs cross-asset composite {composite:+.2f}%."
+            )
+        rows.append(_indicator_row("Cross-Asset Leadership Delta (%)", delta, x_interp, x_expl))
+    else:
+        rows.append(
+            _indicator_row(
+                "Cross-Asset Leadership Delta (%)",
+                None,
+                "Cross-asset leadership unavailable.",
+                "Could not fetch enough ES/NQ/sector premarket data for a reliable leadership read.",
+            )
+        )
+
+    options_ctx = market_context.get("options", {}) if isinstance(market_context, dict) else {}
+    if isinstance(options_ctx, dict) and options_ctx.get("available"):
+        gex = _as_valid_float(options_ctx.get("gexMillions"))
+        skew = _as_valid_float(options_ctx.get("putCallSkew"))
+        flow_ratio = _as_valid_float(options_ctx.get("unusualFlowRatio"))
+        flow_side = str(options_ctx.get("unusualFlowSide") or "").lower()
+        put_call_oi_ratio = _as_valid_float(options_ctx.get("putCallOiRatio"))
+
+        if gex is None:
+            gex_interp = "GEX unavailable."
+            gex_expl = "Could not compute aggregate gamma exposure from current chain snapshot."
+        elif gex >= 0:
+            gex_interp = "Net gamma exposure is positive."
+            gex_expl = (
+                "Positive GEX often dampens intraday volatility; mean-reversion setups and tighter targets can work better."
+            )
+        else:
+            gex_interp = "Net gamma exposure is negative."
+            gex_expl = (
+                "Negative GEX can amplify directional moves; favor trend-following and avoid averaging into losers."
+            )
+        rows.append(_indicator_row("Options Gamma Exposure (GEX, $MM)", gex, gex_interp, gex_expl))
+
+        if skew is None:
+            skew_interp = "Put/Call skew unavailable."
+            skew_expl = "Could not compare OTM put IV vs OTM call IV from current options chain."
+        elif skew >= 0.03:
+            skew_interp = "Put skew is elevated."
+            skew_expl = (
+                "Downside hedging demand is high; treat long setups cautiously and insist on stronger confirmation."
+            )
+        elif skew <= -0.03:
+            skew_interp = "Call skew is elevated."
+            skew_expl = (
+                "Upside optionality demand is stronger; bullish continuation setups gain tailwind if price confirms."
+            )
+        else:
+            skew_interp = "Volatility skew is near neutral."
+            skew_expl = "Options market is not strongly tilted; rely more on price/volume than options skew."
+        if put_call_oi_ratio is not None:
+            skew_expl = f"{skew_expl} Put/Call OI ratio: {put_call_oi_ratio:.2f}."
+        rows.append(_indicator_row("Options Put/Call Skew", skew, skew_interp, skew_expl))
+
+        if flow_ratio is None or not flow_side:
+            flow_interp = "No unusual options flow flagged."
+            flow_expl = "No high volume/open-interest outlier contract in the current chain snapshot."
+        elif flow_ratio >= 3.0:
+            flow_interp = f"Unusual {flow_side} flow detected."
+            flow_expl = (
+                "Volume is multiple times open interest (sweep proxy); monitor that direction, "
+                "but wait for price confirmation before entering."
+            )
+        else:
+            flow_interp = "Options flow is active but not extreme."
+            flow_expl = "Flow is noteworthy but not a clear sweep-style outlier; treat it as secondary confirmation only."
+        contract_text = options_ctx.get("unusualFlowContract")
+        if contract_text:
+            flow_expl = f"{flow_expl} Most active outlier contract: {contract_text}."
+        rows.append(_indicator_row("Unusual Sweep Activity (Proxy)", flow_ratio, flow_interp, flow_expl))
+    else:
+        note = options_ctx.get("note") if isinstance(options_ctx, dict) else None
+        rows.extend(
+            [
+                _indicator_row(
+                    "Options Gamma Exposure (GEX, $MM)",
+                    None,
+                    "Options-derived signal unavailable.",
+                    str(note or "No options chain feed available for this symbol."),
+                ),
+                _indicator_row(
+                    "Options Put/Call Skew",
+                    None,
+                    "Options-derived signal unavailable.",
+                    str(note or "No options chain feed available for this symbol."),
+                ),
+                _indicator_row(
+                    "Unusual Sweep Activity (Proxy)",
+                    None,
+                    "Options-derived signal unavailable.",
+                    str(note or "No options chain feed available for this symbol."),
+                ),
+            ]
+        )
+
+    return rows
+
+
 def _session_change_context(data: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
     if data.empty:
         return None, None
@@ -470,7 +932,7 @@ def _session_change_context(data: pd.DataFrame) -> Tuple[Optional[float], Option
         return None, None
 
 
-def _build_holistic_rows(data: pd.DataFrame) -> List[Dict[str, Any]]:
+def _build_holistic_rows(data: pd.DataFrame, market_context: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     if data.empty:
         return []
 
@@ -509,6 +971,107 @@ def _build_holistic_rows(data: pd.DataFrame) -> List[Dict[str, Any]]:
     _vote(close > psar if psar is not None else None)
     _vote(macd > macd_signal if macd is not None and macd_signal is not None else None)
     _vote(chaikin > 0 if chaikin is not None else None)
+
+    advanced_context_notes: List[str] = []
+    advanced_conflicts: List[str] = []
+    advanced_metrics = _compute_advanced_flow_metrics(data, market_context=market_context)
+
+    ofi_ratio = _as_valid_float(advanced_metrics.get("ofi_ratio"))
+    aggressor_imbalance = _as_valid_float(advanced_metrics.get("aggressor_imbalance"))
+    vpin = _as_valid_float(advanced_metrics.get("vpin"))
+    open_auction = _as_valid_float(advanced_metrics.get("opening_auction_score"))
+    close_auction = _as_valid_float(advanced_metrics.get("closing_auction_score"))
+
+    if ofi_ratio is not None:
+        if ofi_ratio >= 0.10:
+            _vote(True)
+            advanced_context_notes.append("OFI supports buyers")
+        elif ofi_ratio <= -0.10:
+            _vote(False)
+            advanced_context_notes.append("OFI supports sellers")
+
+    if aggressor_imbalance is not None:
+        if aggressor_imbalance >= 0.12:
+            _vote(True)
+            advanced_context_notes.append("aggressor flow favors buyers")
+        elif aggressor_imbalance <= -0.12:
+            _vote(False)
+            advanced_context_notes.append("aggressor flow favors sellers")
+
+    if open_auction is not None:
+        if open_auction >= 0.6:
+            _vote(True)
+            advanced_context_notes.append("opening auction pressure is buy-side")
+        elif open_auction <= -0.6:
+            _vote(False)
+            advanced_context_notes.append("opening auction pressure is sell-side")
+
+    if close_auction is not None:
+        if close_auction >= 0.6:
+            advanced_context_notes.append("closing auction indicates buy-side continuation risk")
+        elif close_auction <= -0.6:
+            advanced_context_notes.append("closing auction indicates sell-side continuation risk")
+
+    if vpin is not None and vpin >= 0.65:
+        advanced_conflicts.append("VPIN is elevated (flow toxicity risk)")
+
+    cross_asset = market_context.get("crossAsset", {}) if isinstance(market_context, dict) else {}
+    cross_asset_available = False
+    cross_asset_lead_state: Optional[str] = None
+    cross_asset_composite: Optional[float] = None
+    if isinstance(cross_asset, dict) and cross_asset.get("available"):
+        cross_asset_available = True
+        cross_asset_lead_state = str(cross_asset.get("leadState") or "aligned")
+        cross_asset_composite = _as_valid_float(cross_asset.get("compositeLeadMovePct"))
+        lead_state = cross_asset_lead_state
+        composite = cross_asset_composite
+        if lead_state in {"aligned", "leading"} and composite is not None:
+            if composite >= 0.25:
+                _vote(True)
+                advanced_context_notes.append("cross-asset leadership is bullish")
+            elif composite <= -0.25:
+                _vote(False)
+                advanced_context_notes.append("cross-asset leadership is bearish")
+        elif lead_state == "lagging_upside":
+            advanced_conflicts.append("cross-asset tone is bullish but symbol is lagging")
+        elif lead_state == "lagging_downside":
+            advanced_conflicts.append("cross-asset tone is bearish but symbol is resisting")
+
+    options_ctx = market_context.get("options", {}) if isinstance(market_context, dict) else {}
+    options_available = False
+    gex = None
+    skew = None
+    flow_side = ""
+    flow_ratio = None
+    put_call_oi_ratio = None
+    if isinstance(options_ctx, dict) and options_ctx.get("available"):
+        options_available = True
+        gex = _as_valid_float(options_ctx.get("gexMillions"))
+        skew = _as_valid_float(options_ctx.get("putCallSkew"))
+        flow_side = str(options_ctx.get("unusualFlowSide") or "").lower()
+        flow_ratio = _as_valid_float(options_ctx.get("unusualFlowRatio"))
+        put_call_oi_ratio = _as_valid_float(options_ctx.get("putCallOiRatio"))
+
+        if skew is not None:
+            if skew >= 0.03:
+                _vote(False)
+                advanced_context_notes.append("put skew is elevated")
+            elif skew <= -0.03:
+                _vote(True)
+                advanced_context_notes.append("call skew is elevated")
+
+        if flow_ratio is not None and flow_ratio >= 3.0 and flow_side in {"call", "put"}:
+            _vote(flow_side == "call")
+            advanced_context_notes.append(f"unusual {flow_side} flow is present")
+
+        if put_call_oi_ratio is not None:
+            if put_call_oi_ratio >= 1.2:
+                _vote(False)
+            elif put_call_oi_ratio <= 0.8:
+                _vote(True)
+
+        if gex is not None and gex < 0:
+            advanced_conflicts.append("negative GEX can amplify directional volatility")
 
     bias_delta = bull - bear
     if bias_delta >= 2:
@@ -614,12 +1177,31 @@ def _build_holistic_rows(data: pd.DataFrame) -> List[Dict[str, Any]]:
                 "so conviction is unchanged."
             )
 
+    if vpin is not None and vpin >= 0.65:
+        conviction_tier = max(0, conviction_tier - 1)
+    if gex is not None and gex < 0:
+        conviction_tier = max(0, conviction_tier - 1)
+    flow_alignment_bonus = 0
+    if ofi_ratio is not None and aggressor_imbalance is not None:
+        if ofi_ratio >= 0.10 and aggressor_imbalance >= 0.12:
+            flow_alignment_bonus = 1
+        elif ofi_ratio <= -0.10 and aggressor_imbalance <= -0.12:
+            flow_alignment_bonus = 1
+    if flow_alignment_bonus:
+        conviction_tier = min(2, conviction_tier + flow_alignment_bonus)
+
     conviction = ("low conviction", "moderate conviction", "high conviction")[conviction_tier]
 
+    all_conflicts = conflicts + advanced_conflicts
     conflict_text = (
         "No major indicator conflicts detected."
-        if not conflicts
-        else "Conflict watch: " + "; ".join(conflicts[:3]) + "."
+        if not all_conflicts
+        else "Conflict watch: " + "; ".join(all_conflicts[:4]) + "."
+    )
+    advanced_context_text = (
+        " Advanced context: " + "; ".join(advanced_context_notes[:4]) + "."
+        if advanced_context_notes
+        else ""
     )
 
     overall_interpretation = (
@@ -644,7 +1226,7 @@ def _build_holistic_rows(data: pd.DataFrame) -> List[Dict[str, Any]]:
     overall_interpretation = f"{overall_interpretation}{session_text}".strip()
     overall_explanation = (
         f"Alignment: {bull} bullish vs {bear} bearish trend/momentum votes. "
-        f"{conflict_text} {regime_guidance} {volume_context}{session_conflict_text}"
+        f"{conflict_text}{advanced_context_text} {regime_guidance} {volume_context}{session_conflict_text}"
     )
 
     if regime == "strong trend":
@@ -689,7 +1271,7 @@ def _build_holistic_rows(data: pd.DataFrame) -> List[Dict[str, Any]]:
 
     if bias == "mixed" or regime == "unclear regime":
         risk_mode = "Defensive"
-    elif conflicts:
+    elif all_conflicts:
         risk_mode = "Defensive"
     elif conviction == "high conviction" and regime in {"strong trend", "developing trend"} and bias in {
         "bullish",
@@ -702,6 +1284,70 @@ def _build_holistic_rows(data: pd.DataFrame) -> List[Dict[str, Any]]:
         risk_mode = "Standard" if conviction == "high conviction" else "Defensive"
     else:
         risk_mode = "Standard"
+
+    priority_drivers: List[str] = []
+    key_risks: List[str] = []
+
+    def _add_unique(items: List[str], text: str) -> None:
+        if text and text not in items:
+            items.append(text)
+
+    if bias == "bullish":
+        if ofi_ratio is not None and aggressor_imbalance is not None and ofi_ratio >= 0.10 and aggressor_imbalance >= 0.12:
+            _add_unique(priority_drivers, "OFI and aggressor flow both favor buyers")
+        elif ofi_ratio is not None and ofi_ratio >= 0.10:
+            _add_unique(priority_drivers, "OFI favors buyers")
+        elif aggressor_imbalance is not None and aggressor_imbalance >= 0.12:
+            _add_unique(priority_drivers, "aggressor flow favors buyers")
+
+        if cross_asset_available and cross_asset_composite is not None and cross_asset_composite >= 0.25 and cross_asset_lead_state in {"aligned", "leading"}:
+            _add_unique(priority_drivers, "cross-asset leadership is supportive")
+        if options_available and skew is not None and skew <= -0.03:
+            _add_unique(priority_drivers, "call skew supports upside")
+        if options_available and flow_ratio is not None and flow_ratio >= 3.0 and flow_side == "call":
+            _add_unique(priority_drivers, "unusual call flow supports continuation")
+
+        if vpin is not None and vpin >= 0.65:
+            _add_unique(key_risks, "VPIN is elevated")
+        if gex is not None and gex < 0:
+            _add_unique(key_risks, "negative GEX can amplify volatility")
+        if cross_asset_lead_state == "lagging_upside":
+            _add_unique(key_risks, "symbol is lagging a bullish cross-asset tape")
+        if options_available and skew is not None and skew >= 0.03:
+            _add_unique(key_risks, "put skew reflects downside hedge demand")
+    elif bias == "bearish":
+        if ofi_ratio is not None and aggressor_imbalance is not None and ofi_ratio <= -0.10 and aggressor_imbalance <= -0.12:
+            _add_unique(priority_drivers, "OFI and aggressor flow both favor sellers")
+        elif ofi_ratio is not None and ofi_ratio <= -0.10:
+            _add_unique(priority_drivers, "OFI favors sellers")
+        elif aggressor_imbalance is not None and aggressor_imbalance <= -0.12:
+            _add_unique(priority_drivers, "aggressor flow favors sellers")
+
+        if cross_asset_available and cross_asset_composite is not None and cross_asset_composite <= -0.25 and cross_asset_lead_state in {"aligned", "leading"}:
+            _add_unique(priority_drivers, "cross-asset leadership is risk-off")
+        if options_available and skew is not None and skew >= 0.03:
+            _add_unique(priority_drivers, "put skew supports downside caution")
+        if options_available and flow_ratio is not None and flow_ratio >= 3.0 and flow_side == "put":
+            _add_unique(priority_drivers, "unusual put flow supports downside")
+
+        if vpin is not None and vpin >= 0.65:
+            _add_unique(key_risks, "VPIN is elevated")
+        if gex is not None and gex < 0:
+            _add_unique(key_risks, "negative GEX can increase downside swings")
+        if cross_asset_lead_state == "lagging_downside":
+            _add_unique(key_risks, "symbol is resisting a bearish cross-asset tape")
+        if options_available and skew is not None and skew <= -0.03:
+            _add_unique(key_risks, "call skew may reduce downside follow-through")
+    else:
+        if advanced_context_notes:
+            _add_unique(priority_drivers, "; ".join(advanced_context_notes[:2]))
+        if advanced_conflicts:
+            _add_unique(key_risks, "; ".join(advanced_conflicts[:2]))
+
+    if priority_drivers:
+        action_explanation = f"{action_explanation} Primary drivers: {'; '.join(priority_drivers[:3])}."
+    if key_risks:
+        action_explanation = f"{action_explanation} Key risk: {'; '.join(key_risks[:2])}."
 
     action_interpretation = f"{action_interpretation} [Risk Mode: {risk_mode}]"
 
@@ -727,7 +1373,7 @@ def _build_holistic_rows(data: pd.DataFrame) -> List[Dict[str, Any]]:
     ]
 
 
-def build_indicator_summary(data: pd.DataFrame) -> List[Dict[str, Any]]:
+def build_indicator_summary(data: pd.DataFrame, market_context: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     if data.empty:
         return []
     last = data.iloc[-1]
@@ -737,95 +1383,81 @@ def build_indicator_summary(data: pd.DataFrame) -> List[Dict[str, Any]]:
     macd_signal = float(last.get("MACD_SIGNAL") or np.nan)
     adx = float(last.get("ADX_14") or np.nan)
 
-    def _row(key: str, value: Any, interpretation: str, explanation: str) -> Dict[str, Any]:
-        v = None
-        try:
-            if value is not None and not (isinstance(value, float) and math.isnan(value)):
-                v = float(value)
-        except Exception:
-            v = None
-        return {
-            "key": key,
-            "value": v,
-            "interpretation": interpretation,
-            "explanation": explanation,
-        }
-
     rows = [
-        _row(
+        _indicator_row(
             "SMA (20)",
             last.get("SMA_20"),
             "Bullish bias above SMA." if close > (last.get("SMA_20") or close) else "Bearish bias below SMA.",
             "Simple Moving Average smooths recent price to show trend direction.",
         ),
-        _row(
+        _indicator_row(
             "EMA (20)",
             last.get("EMA_20"),
             "Price above EMA can signal near-term strength." if close > (last.get("EMA_20") or close) else "Price below EMA can signal near-term weakness.",
             "Exponential Moving Average reacts faster than SMA to recent changes.",
         ),
-        _row(
+        _indicator_row(
             "MACD",
             macd,
             "Momentum improving (MACD > signal)." if macd > macd_signal else "Momentum fading (MACD < signal).",
             "MACD tracks momentum by comparing short and long EMAs.",
         ),
-        _row(
+        _indicator_row(
             "RSI (14)",
             rsi,
             "Overbought risk." if rsi >= 70 else ("Oversold bounce zone." if rsi <= 30 else "Neutral momentum."),
             "RSI measures recent up/down velocity on a 0-100 scale.",
         ),
-        _row(
+        _indicator_row(
             "Bollinger %B",
             last.get("BB_PCT"),
             "Upper-band pressure." if (last.get("BB_PCT") or 0) >= 0.8 else ("Lower-band pressure." if (last.get("BB_PCT") or 0) <= 0.2 else "Mid-band equilibrium."),
             "Bollinger Bands estimate volatility and where price sits in that range.",
         ),
-        _row(
+        _indicator_row(
             "Stochastic %K",
             last.get("STOCH_K"),
             "Momentum stretched high." if (last.get("STOCH_K") or 0) > 80 else ("Momentum stretched low." if (last.get("STOCH_K") or 0) < 20 else "Momentum balanced."),
             "Stochastic compares close to recent high/low range.",
         ),
-        _row(
+        _indicator_row(
             "Accum/Dist (ADL)",
             last.get("ADL"),
             "Buying pressure rising." if (last.get("CHAIKIN") or 0) > 0 else "Selling pressure rising.",
             "Accumulation/Distribution approximates whether volume confirms buying or selling.",
         ),
-        _row(
+        _indicator_row(
             "Chaikin Oscillator",
             last.get("CHAIKIN"),
             "Positive money-flow momentum." if (last.get("CHAIKIN") or 0) > 0 else "Negative money-flow momentum.",
             "Chaikin is a momentum view of accumulation/distribution flow.",
         ),
-        _row(
+        _indicator_row(
             "Parabolic SAR (proxy)",
             last.get("PSAR"),
             "Bullish trend support." if close > (last.get("PSAR") or close) else "Bearish trend pressure.",
             "Parabolic SAR estimates likely trailing stop direction.",
         ),
-        _row(
+        _indicator_row(
             "VWMA (20)",
             last.get("VWMA_20"),
             "Price leading weighted trend." if close > (last.get("VWMA_20") or close) else "Price below weighted trend.",
             "VWMA weights price by volume to highlight conviction.",
         ),
-        _row(
+        _indicator_row(
             "ADX (14)",
             adx,
             "Strong trend regime." if adx >= 25 else "Weak/sideways trend regime.",
             "ADX measures trend strength, not direction.",
         ),
-        _row(
+        _indicator_row(
             "VWAP",
             last.get("VWAP"),
             "Above VWAP favors long continuation." if close > (last.get("VWAP") or close) else "Below VWAP favors cautious or short bias.",
             "VWAP is the session's volume-weighted fair-price benchmark.",
         ),
     ]
-    return _build_holistic_rows(data) + rows
+    return _build_holistic_rows(data, market_context=market_context) + _advanced_indicator_rows(data, market_context=market_context) + rows
 
 
 def fibonacci_indicator_rows(data: pd.DataFrame, fib: Dict[str, float]) -> List[Dict[str, Any]]:

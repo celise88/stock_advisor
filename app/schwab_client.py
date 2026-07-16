@@ -142,6 +142,10 @@ class SchwabClient:
         )
         return self._sdk_client
 
+    def get_sdk_client(self):
+        """Public accessor for callers that need schwab-py SDK primitives."""
+        return self._get_sdk_client()
+
     def _resolve_account_hash(self) -> str:
         if self._account_hash:
             return self._account_hash

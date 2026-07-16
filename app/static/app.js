@@ -4,6 +4,8 @@ const state = {
   days: 3,
   chartHasCandles: false,
   currentPrice: null,
+  streamReconnectCooldownUntilMs: 0,
+  streamReconnectLastAttemptMs: null,
 };
 
 async function api(path, options = {}) {
@@ -61,6 +63,31 @@ function fmtSigned(v, digits = 2) {
   return `${sign}${fmtNumber(n, digits)}`;
 }
 
+function fmtAgeSeconds(v) {
+  if (!isValidNumber(v)) return "—";
+  const sec = Math.max(0, Number(v));
+  if (sec < 60) return `${Math.round(sec)}s`;
+  const minutes = Math.floor(sec / 60);
+  const seconds = Math.round(sec % 60);
+  return `${minutes}m ${seconds}s`;
+}
+
+function fmtLocalDateTime(ms) {
+  if (!isValidNumber(ms)) return "Never";
+  try {
+    return new Date(Number(ms)).toLocaleString();
+  } catch {
+    return "Never";
+  }
+}
+
+function fmtIsoDateTime(iso) {
+  if (!iso) return "—";
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return "—";
+  return dt.toLocaleString();
+}
+
 function isValidNumber(v) {
   return v !== null && v !== undefined && !Number.isNaN(Number(v));
 }
@@ -108,14 +135,104 @@ function renderActionBias(actionIndicator) {
   el.textContent = fullText;
 }
 
+function renderStreamDiagnostics(health) {
+  const grid = document.getElementById("stream-diagnostics-grid");
+  const errorBox = document.getElementById("stream-diagnostics-error");
+  if (!grid || !errorBox) return;
+
+  const enabled = Boolean(health.schwabStreamEnabled);
+  const connected = Boolean(health.schwabStreamConnected);
+  const stateText = !enabled ? "Disabled" : (connected ? "Connected" : "Disconnected");
+  const trackedSymbols = isValidNumber(health.schwabStreamTrackedSymbols)
+    ? fmtNumber(health.schwabStreamTrackedSymbols, 0)
+    : "—";
+  const messageAge = fmtAgeSeconds(health.schwabStreamLastMessageAgeSec);
+  const cooldownRemainingSec = Math.max(0, Math.ceil((state.streamReconnectCooldownUntilMs - Date.now()) / 1000));
+  const cooldownText = cooldownRemainingSec > 0 ? `${cooldownRemainingSec}s` : "Ready";
+  const lastAttemptText = fmtLocalDateTime(state.streamReconnectLastAttemptMs);
+
+  const rows = [
+    { label: "State", value: stateText },
+    { label: "Tracked Symbols", value: trackedSymbols },
+    { label: "Last Message Age", value: messageAge },
+    { label: "Reconnect Cooldown", value: cooldownText },
+    { label: "Last Reconnect Attempt", value: lastAttemptText },
+    { label: "Schwab Config", value: health.schwabEnabled ? "Configured" : "Not configured" },
+  ];
+
+  grid.innerHTML = rows
+    .map((r) => `
+      <div class="diag-item">
+        <div class="diag-label">${r.label}</div>
+        <div class="diag-value">${r.value}</div>
+      </div>
+    `)
+    .join("");
+
+  const err = health.schwabStreamLastError;
+  if (err) {
+    errorBox.textContent = `Last stream error: ${err}`;
+  } else if (!enabled) {
+    errorBox.textContent = "Stream diagnostics: Schwab streaming is disabled.";
+  } else if (!connected) {
+    errorBox.textContent = "No active stream connection yet. Waiting for login/subscription.";
+  } else {
+    errorBox.textContent = "No stream errors reported.";
+  }
+}
+
+function updateReconnectButton() {
+  const btn = document.getElementById("stream-restart-btn");
+  if (!btn) return;
+  const cooldownRemainingSec = Math.max(0, Math.ceil((state.streamReconnectCooldownUntilMs - Date.now()) / 1000));
+  if (cooldownRemainingSec > 0) {
+    btn.disabled = true;
+    btn.textContent = `Reconnect Stream (${cooldownRemainingSec}s)`;
+  } else {
+    btn.disabled = false;
+    btn.textContent = "Reconnect Stream";
+  }
+}
+
 async function loadHealth() {
   const health = await api("/api/health");
+  const streamState = health.schwabStreamEnabled
+    ? (health.schwabStreamConnected ? "Connected" : "Disconnected")
+    : "Disabled";
   document.getElementById("health-status").textContent =
-    `API: ${health.status} | Schwab: ${health.schwabEnabled ? "Configured" : "Not configured"}`;
+    `API: ${health.status} | Schwab: ${health.schwabEnabled ? "Configured" : "Not configured"} | Stream: ${streamState}`;
   document.getElementById("scanner-interval").value = health.scannerIntervalSec;
   document.getElementById("scanner-market-cap").value = health.scannerMarketCapMin ?? 2000000000;
   document.getElementById("scanner-avg-volume").value = health.scannerAvgVolumeMin ?? 500000;
   document.getElementById("scanner-rel-volume").value = health.scannerRelativeVolumeMin ?? 1.5;
+  renderStreamDiagnostics(health);
+}
+
+async function reconnectStream() {
+  const btn = document.getElementById("stream-restart-btn");
+  const now = Date.now();
+  const cooldownRemainingSec = Math.max(0, Math.ceil((state.streamReconnectCooldownUntilMs - now) / 1000));
+  if (cooldownRemainingSec > 0) {
+    document.getElementById("health-status").textContent =
+      `Reconnect on cooldown: wait ${cooldownRemainingSec}s before retrying.`;
+    updateReconnectButton();
+    return;
+  }
+
+  state.streamReconnectLastAttemptMs = now;
+  state.streamReconnectCooldownUntilMs = now + 15000;
+  updateReconnectButton();
+  if (btn) btn.disabled = true;
+  try {
+    const result = await api("/api/stream/restart", { method: "POST" });
+    const statusText = result?.status === "ok" ? "Stream reconnect requested." : `Stream reconnect skipped: ${result?.reason || "unknown reason"}.`;
+    document.getElementById("health-status").textContent = statusText;
+  } catch (err) {
+    document.getElementById("health-status").textContent = `Stream reconnect failed: ${err.message}`;
+  } finally {
+    await loadHealth();
+    updateReconnectButton();
+  }
 }
 
 async function loadScanner() {
@@ -376,12 +493,18 @@ async function loadJournal() {
     const closeBtn = t.status === "open"
       ? `<button class="close-trade-btn" data-trade-id="${t.trade_id}">Close</button>`
       : "";
+    const rowDateTime =
+      (t.status === "closed" ? (t.closed_at || null) : null) ||
+      t.updated_at ||
+      t.opened_at ||
+      null;
     tr.innerHTML = `
       <td>${t.trade_id || ""}</td>
+      <td>${fmtIsoDateTime(rowDateTime)}</td>
       <td>${t.symbol || ""}</td>
-      <td>${t.side || ""}</td>
       <td>${t.quantity || ""}</td>
       <td>${fmtNumber(t.entry_price)}</td>
+      <td>${fmtNumber(t.exit_price)}</td>
       <td>${t.status || ""} ${closeBtn}</td>
       <td>${t.broker_status || "—"}</td>
       <td>${fmtNumber(t.pnl)}</td>
@@ -398,8 +521,9 @@ async function syncTrades() {
     const errorCount = (result.errors || []).length;
     const importedCount = Number(result.historyImport?.importedClosedTrades || 0);
     const loggedOrderCount = Number(result.historyImport?.loggedOrders || 0);
+    const backfilledTsCount = Number(result.historyImport?.backfilledTradeTimestamps || 0);
     document.getElementById("trade-result").textContent =
-      `Sync complete. Updates: ${updateCount}, Imported closed trades: ${importedCount}, Imported orders: ${loggedOrderCount}, Errors: ${errorCount}`;
+      `Sync complete. Updates: ${updateCount}, Imported closed trades: ${importedCount}, Timestamp backfills: ${backfilledTsCount}, Imported orders: ${loggedOrderCount}, Errors: ${errorCount}`;
     await loadJournal();
   } catch (err) {
     document.getElementById("trade-result").textContent = `Sync failed: ${err.message}`;
@@ -454,6 +578,7 @@ function wireEvents() {
   document.getElementById("refresh-journal-btn").addEventListener("click", loadJournal);
   document.getElementById("sync-trades-btn").addEventListener("click", syncTrades);
   document.getElementById("trade-form").addEventListener("submit", submitTrade);
+  document.getElementById("stream-restart-btn").addEventListener("click", reconnectStream);
 
   document.body.addEventListener("click", async (event) => {
     const pickBtn = event.target.closest(".pick-symbol-btn");
@@ -472,12 +597,15 @@ function wireEvents() {
 async function boot() {
   wireEvents();
   await loadHealth();
+  updateReconnectButton();
   const bootResults = await Promise.allSettled([loadScanner(), loadSymbolWorkspace(), loadJournal()]);
   const failures = bootResults.filter((r) => r.status === "rejected");
   if (failures.length) {
     document.getElementById("health-status").textContent =
       `App loaded with ${failures.length} startup warning${failures.length > 1 ? "s" : ""}.`;
   }
+  setInterval(loadHealth, 10000);
+  setInterval(updateReconnectButton, 1000);
   setInterval(loadScanner, 30000);
   setInterval(loadQuote, 5000);
   setInterval(syncTrades, 20000);

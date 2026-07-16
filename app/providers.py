@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,6 +11,7 @@ import yfinance as yf
 
 from .config import SETTINGS
 from .schwab_client import SchwabClient
+from .streaming_service import SchwabStreamService
 
 
 class TTLCache:
@@ -36,12 +38,17 @@ class MarketDataProvider:
     ALPHAVANTAGE_BASE = "https://www.alphavantage.co/query"
     NASDAQ_BASE = "https://api.nasdaq.com/api"
 
-    def __init__(self, schwab_client: Optional[SchwabClient] = None) -> None:
+    def __init__(
+        self,
+        schwab_client: Optional[SchwabClient] = None,
+        stream_service: Optional[SchwabStreamService] = None,
+    ) -> None:
         self.session = requests.Session()
         self.cache = TTLCache(ttl_sec=180)
         self.finnhub_api_key = SETTINGS.finnhub_api_key
         self.alphavantage_api_key = SETTINGS.alphavantage_api_key
         self.schwab_client = schwab_client
+        self.stream_service = stream_service
         self._intraday_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
         self._intraday_cache_ttl_sec = 120
         self._yfinance_disabled = SETTINGS.disable_yfinance
@@ -766,6 +773,394 @@ class MarketDataProvider:
             "exchange": info.get("exchange"),
             "dataError": info.get("dataError"),
             "dataWarning": info.get("dataWarning"),
+        }
+
+    def streaming_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        if not self.stream_service:
+            return None
+        self.stream_service.ensure_symbol(symbol)
+        snap = self.stream_service.quote_snapshot(symbol)
+        if not snap:
+            return None
+        return {
+            "symbol": str(snap.get("symbol") or symbol).upper(),
+            "bid": snap.get("bid"),
+            "ask": snap.get("ask"),
+            "last": snap.get("last"),
+            "bidSize": snap.get("bidSize"),
+            "askSize": snap.get("askSize"),
+            "totalVolume": snap.get("totalVolume"),
+            "ageSec": snap.get("ageSec"),
+        }
+
+    def streaming_flow_snapshot(self, symbol: str) -> Dict[str, Any]:
+        if not self.stream_service:
+            return {
+                "available": False,
+                "ofi": None,
+                "aggressorImbalance": None,
+                "vpin": None,
+                "note": "Streaming service disabled.",
+            }
+        self.stream_service.ensure_symbol(symbol)
+        return self.stream_service.flow_snapshot(symbol)
+
+    @staticmethod
+    def _sector_etf_for(sector_name: Optional[str]) -> Optional[str]:
+        if not sector_name:
+            return None
+        sector = str(sector_name).strip().lower()
+        sector_map = {
+            "technology": "XLK",
+            "communication": "XLC",
+            "consumer discretionary": "XLY",
+            "consumer staples": "XLP",
+            "financial": "XLF",
+            "health": "XLV",
+            "industrial": "XLI",
+            "energy": "XLE",
+            "materials": "XLB",
+            "real estate": "XLRE",
+            "utilities": "XLU",
+        }
+        for key, etf in sector_map.items():
+            if key in sector:
+                return etf
+        return None
+
+    @staticmethod
+    def _premarket_move_pct(frame: pd.DataFrame) -> Optional[float]:
+        if frame is None or frame.empty:
+            return None
+        try:
+            work = frame.copy().sort_index()
+            if isinstance(work.columns, pd.MultiIndex):
+                work.columns = [c[0] for c in work.columns]
+            for col in ("Open", "Close"):
+                if col not in work.columns:
+                    return None
+            work.index = pd.to_datetime(work.index, utc=True, errors="coerce")
+            work = work[~work.index.isna()]
+            if work.empty:
+                return None
+
+            et_index = work.index.tz_convert("America/New_York")
+            work["__date"] = et_index.date
+            work["__minutes"] = et_index.hour * 60 + et_index.minute
+
+            latest_date = work["__date"].iloc[-1]
+            day = work[work["__date"] == latest_date]
+            premarket = day[(day["__minutes"] >= 4 * 60) & (day["__minutes"] < 9 * 60 + 30)]
+            if premarket.empty:
+                return None
+
+            prior_days = sorted([d for d in set(work["__date"]) if d < latest_date])
+            prev_close = None
+            if prior_days:
+                prev_day = work[work["__date"] == prior_days[-1]]
+                prev_rth = prev_day[(prev_day["__minutes"] >= 9 * 60 + 30) & (prev_day["__minutes"] <= 16 * 60)]
+                prev_close = (
+                    float(prev_rth["Close"].iloc[-1])
+                    if not prev_rth.empty and pd.notna(prev_rth["Close"].iloc[-1])
+                    else None
+                )
+
+            pre_open = (
+                float(premarket["Open"].iloc[0])
+                if pd.notna(premarket["Open"].iloc[0])
+                else float(premarket["Close"].iloc[0])
+            )
+            pre_last = (
+                float(premarket["Close"].iloc[-1])
+                if pd.notna(premarket["Close"].iloc[-1])
+                else None
+            )
+            if pre_last is None:
+                return None
+
+            baseline = prev_close if prev_close not in (None, 0) else pre_open
+            if baseline in (None, 0):
+                return None
+            return ((pre_last - float(baseline)) / float(baseline)) * 100.0
+        except Exception:
+            return None
+
+    def cross_asset_leadership_snapshot(
+        self,
+        symbol: str,
+        interval: str = "5m",
+        days: int = 3,
+        history: Optional[pd.DataFrame] = None,
+    ) -> Dict[str, Any]:
+        cache_key = f"cross_asset:{symbol.upper()}:{interval}:{int(days)}"
+        cached = self.cache.get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+
+        out: Dict[str, Any] = {
+            "available": False,
+            "symbolPremarketMovePct": None,
+            "esPremarketMovePct": None,
+            "nqPremarketMovePct": None,
+            "sectorEtf": None,
+            "sectorPremarketMovePct": None,
+            "compositeLeadMovePct": None,
+            "leadDeltaPct": None,
+            "leadState": "unavailable",
+            "note": "Insufficient premarket context from available feeds.",
+        }
+
+        base_frame = history if history is not None and not history.empty else self.intraday_history(symbol, interval, max(days, 2))
+        symbol_move = self._premarket_move_pct(base_frame)
+        out["symbolPremarketMovePct"] = symbol_move
+
+        info = self.ticker_info(symbol, include_ownership_fallbacks=False)
+        sector_etf = self._sector_etf_for(info.get("sector"))
+        out["sectorEtf"] = sector_etf
+
+        ref_tickers: List[str] = ["ES=F", "NQ=F"]
+        if sector_etf and sector_etf not in ref_tickers:
+            ref_tickers.append(sector_etf)
+
+        ref_moves: Dict[str, float] = {}
+        for ticker in ref_tickers:
+            frame = self.intraday_history(ticker, interval, max(days, 2))
+            move = self._premarket_move_pct(frame)
+            if move is not None:
+                ref_moves[ticker] = float(move)
+
+        out["esPremarketMovePct"] = ref_moves.get("ES=F")
+        out["nqPremarketMovePct"] = ref_moves.get("NQ=F")
+        out["sectorPremarketMovePct"] = ref_moves.get(sector_etf) if sector_etf else None
+
+        composite_inputs = [
+            value
+            for value in (
+                out["esPremarketMovePct"],
+                out["nqPremarketMovePct"],
+                out["sectorPremarketMovePct"],
+            )
+            if isinstance(value, (int, float))
+        ]
+        if composite_inputs and symbol_move is not None:
+            composite = float(sum(composite_inputs) / len(composite_inputs))
+            delta = float(symbol_move - composite)
+            out["available"] = True
+            out["compositeLeadMovePct"] = composite
+            out["leadDeltaPct"] = delta
+
+            if composite >= 0.30 and delta <= -0.30:
+                lead_state = "lagging_upside"
+                note = "Broad risk tone is bullish but symbol is lagging premarket."
+            elif composite <= -0.30 and delta >= 0.30:
+                lead_state = "lagging_downside"
+                note = "Broad risk tone is bearish but symbol is not confirming downside."
+            elif abs(delta) >= 0.35 and (symbol_move * composite) > 0:
+                lead_state = "leading"
+                note = "Symbol is moving ahead of cross-asset tone in the same direction."
+            else:
+                lead_state = "aligned"
+                note = "Symbol is broadly aligned with futures/sector premarket leadership."
+            out["leadState"] = lead_state
+            out["note"] = note
+
+        self.cache.set(cache_key, out)
+        return out
+
+    @staticmethod
+    def _norm_pdf(x: float) -> float:
+        return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+    @classmethod
+    def _bs_gamma(cls, spot: float, strike: float, t_years: float, sigma: float, r: float = 0.01) -> Optional[float]:
+        if spot <= 0 or strike <= 0 or t_years <= 0 or sigma <= 0:
+            return None
+        try:
+            root_t = math.sqrt(t_years)
+            d1 = (math.log(spot / strike) + (r + 0.5 * sigma * sigma) * t_years) / (sigma * root_t)
+            return cls._norm_pdf(d1) / (spot * sigma * root_t)
+        except Exception:
+            return None
+
+    def options_signal_snapshot(self, symbol: str) -> Dict[str, Any]:
+        cache_key = f"options:{symbol.upper()}"
+        cached = self.cache.get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+
+        unavailable = {
+            "available": False,
+            "spotPrice": None,
+            "gexMillions": None,
+            "gexRegime": "unavailable",
+            "putCallSkew": None,
+            "putCallOiRatio": None,
+            "unusualFlowSide": None,
+            "unusualFlowRatio": None,
+            "unusualFlowContract": None,
+            "note": "Options chain unavailable from current data source.",
+        }
+        if self._yfinance_disabled:
+            unavailable["note"] = "Options chain unavailable because yfinance is disabled."
+            self.cache.set(cache_key, unavailable)
+            return unavailable
+
+        try:
+            ticker = yf.Ticker(symbol)
+            expirations = list(ticker.options or [])
+            if not expirations:
+                self.cache.set(cache_key, unavailable)
+                return unavailable
+
+            info = self.ticker_info(symbol, include_ownership_fallbacks=False)
+            spot = self._as_float(info.get("currentPrice")) or self._as_float(info.get("regularMarketPrice"))
+            if spot in (None, 0):
+                try:
+                    history = ticker.history(period="1d")
+                    if history is not None and not history.empty:
+                        spot = self._as_float(history["Close"].iloc[-1])
+                except Exception:
+                    spot = None
+            if spot in (None, 0):
+                self.cache.set(cache_key, unavailable)
+                return unavailable
+
+            gex_total = 0.0
+            gex_contribs = 0
+            call_frames: List[pd.DataFrame] = []
+            put_frames: List[pd.DataFrame] = []
+            now = dt.datetime.now(dt.timezone.utc)
+
+            for expiry_text in expirations[:2]:
+                expiry_dt = dt.datetime.strptime(expiry_text, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+                t_years = max((expiry_dt - now).total_seconds() / (365.0 * 24.0 * 3600.0), 1.0 / 365.0)
+
+                chain = ticker.option_chain(expiry_text)
+                calls = chain.calls.copy() if isinstance(chain.calls, pd.DataFrame) else pd.DataFrame()
+                puts = chain.puts.copy() if isinstance(chain.puts, pd.DataFrame) else pd.DataFrame()
+                if calls.empty and puts.empty:
+                    continue
+
+                calls["side"] = "call"
+                calls["expiry"] = expiry_text
+                puts["side"] = "put"
+                puts["expiry"] = expiry_text
+                call_frames.append(calls)
+                put_frames.append(puts)
+
+                for frame, sign in ((calls, 1.0), (puts, -1.0)):
+                    if frame.empty:
+                        continue
+                    for _, row in frame.iterrows():
+                        strike = self._as_float(row.get("strike"))
+                        iv = self._as_float(row.get("impliedVolatility"))
+                        oi = self._as_float(row.get("openInterest"))
+                        if strike in (None, 0) or iv in (None, 0) or oi in (None, 0):
+                            continue
+                        gamma = self._bs_gamma(float(spot), float(strike), t_years, float(iv))
+                        if gamma is None:
+                            continue
+                        gex_total += sign * gamma * float(oi) * 100.0 * float(spot) * float(spot)
+                        gex_contribs += 1
+
+            all_calls = pd.concat(call_frames, ignore_index=True) if call_frames else pd.DataFrame()
+            all_puts = pd.concat(put_frames, ignore_index=True) if put_frames else pd.DataFrame()
+            all_options = pd.concat([all_calls, all_puts], ignore_index=True) if (not all_calls.empty or not all_puts.empty) else pd.DataFrame()
+
+            if all_options.empty:
+                self.cache.set(cache_key, unavailable)
+                return unavailable
+
+            def _closest_iv(df: pd.DataFrame, target: float, side: str) -> Optional[float]:
+                if df.empty:
+                    return None
+                work = df.copy()
+                work["strike"] = pd.to_numeric(work.get("strike"), errors="coerce")
+                work["impliedVolatility"] = pd.to_numeric(work.get("impliedVolatility"), errors="coerce")
+                work = work.dropna(subset=["strike", "impliedVolatility"])
+                work = work[work["impliedVolatility"] > 0]
+                if work.empty:
+                    return None
+                if side == "put":
+                    work = work[work["strike"] <= target]
+                elif side == "call":
+                    work = work[work["strike"] >= target]
+                if work.empty:
+                    return None
+                idx = (work["strike"] - target).abs().idxmin()
+                return self._as_float(work.loc[idx, "impliedVolatility"])
+
+            put_iv = _closest_iv(all_puts, float(spot) * 0.95, "put")
+            call_iv = _closest_iv(all_calls, float(spot) * 1.05, "call")
+            skew = (put_iv - call_iv) if put_iv is not None and call_iv is not None else None
+
+            call_oi = pd.to_numeric(all_calls.get("openInterest"), errors="coerce").fillna(0).sum() if not all_calls.empty else 0.0
+            put_oi = pd.to_numeric(all_puts.get("openInterest"), errors="coerce").fillna(0).sum() if not all_puts.empty else 0.0
+            put_call_oi_ratio = float(put_oi / call_oi) if call_oi > 0 else None
+
+            work = all_options.copy()
+            work["volume"] = pd.to_numeric(work.get("volume"), errors="coerce").fillna(0.0)
+            work["openInterest"] = pd.to_numeric(work.get("openInterest"), errors="coerce").fillna(0.0)
+            candidates = work[(work["volume"] >= 50) & (work["openInterest"] > 0)].copy()
+            unusual_side = None
+            unusual_ratio = None
+            unusual_contract = None
+            if not candidates.empty:
+                candidates["flowRatio"] = candidates["volume"] / candidates["openInterest"]
+                best_idx = candidates["flowRatio"].idxmax()
+                best = candidates.loc[best_idx]
+                unusual_side = str(best.get("side") or "").lower() or None
+                unusual_ratio = self._as_float(best.get("flowRatio"))
+                strike = self._as_float(best.get("strike"))
+                expiry = str(best.get("expiry") or "")
+                if strike is not None and expiry:
+                    unusual_contract = f"{expiry} {strike:.2f}"
+
+            gex_millions = float(gex_total / 1_000_000.0) if gex_contribs > 0 else None
+            if gex_millions is None:
+                gex_regime = "unavailable"
+            elif gex_millions >= 0:
+                gex_regime = "positive"
+            else:
+                gex_regime = "negative"
+
+            out = {
+                "available": True,
+                "spotPrice": float(spot),
+                "gexMillions": gex_millions,
+                "gexRegime": gex_regime,
+                "putCallSkew": skew,
+                "putCallOiRatio": put_call_oi_ratio,
+                "unusualFlowSide": unusual_side,
+                "unusualFlowRatio": unusual_ratio,
+                "unusualFlowContract": unusual_contract,
+                "note": "Options-derived metrics are approximations from listed-chain snapshots.",
+            }
+            self.cache.set(cache_key, out)
+            return out
+        except Exception as exc:
+            unavailable["note"] = f"Options snapshot failed: {exc}"
+            self.cache.set(cache_key, unavailable)
+            return unavailable
+
+    def advanced_market_context(
+        self,
+        symbol: str,
+        interval: str = "5m",
+        days: int = 3,
+        history: Optional[pd.DataFrame] = None,
+    ) -> Dict[str, Any]:
+        if self.stream_service:
+            self.stream_service.ensure_symbol(symbol)
+        return {
+            "streaming": self.streaming_flow_snapshot(symbol),
+            "crossAsset": self.cross_asset_leadership_snapshot(
+                symbol=symbol,
+                interval=interval,
+                days=days,
+                history=history,
+            ),
+            "options": self.options_signal_snapshot(symbol),
         }
 
 

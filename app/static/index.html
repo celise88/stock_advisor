@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Stock Advisor</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260715b" />
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   </head>
   <body>
@@ -16,6 +16,17 @@
     </header>
 
     <main class="layout">
+      <section class="panel stream-panel">
+        <div class="panel-head">
+          <h2>Stream Diagnostics</h2>
+          <div class="controls">
+            <button id="stream-restart-btn">Reconnect Stream</button>
+          </div>
+        </div>
+        <div id="stream-diagnostics-grid" class="stream-diag-grid"></div>
+        <div id="stream-diagnostics-error" class="info-box stream-error">No stream error reported.</div>
+      </section>
+
       <section class="panel scanner-panel">
         <div class="panel-head">
           <h2>Scanner</h2>
@@ -157,10 +168,11 @@
             <thead>
               <tr>
                 <th>Trade ID</th>
+                <th>Date/Time</th>
                 <th>Symbol</th>
-                <th>Side</th>
                 <th>Qty</th>
-                <th>Entry</th>
+                <th>Entry Price</th>
+                <th>Exit Price</th>
                 <th>Status</th>
                 <th>Broker</th>
                 <th>P&L</th>
@@ -173,6 +185,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260715b"></script>
   </body>
 </html>
