@@ -131,6 +131,20 @@ class Settings:
             "JBHT",
             "HOMB",
             "KARO",
+            "ISRG",
+            "VIST",
+            "FNB",
+            "FFIN",
+            "INDB",
+            "CNS",
+            "SFNC",
+            "TSM",
+            "UNH",
+            "ISRG",
+            "PLD",
+            "USB",
+            "STT",
+            "CFG",
 
         ]
     )
