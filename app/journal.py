@@ -90,10 +90,12 @@ class TradeJournal:
         broker_order_id: str | None = None,
         broker_location: str | None = None,
         broker_status: str | None = None,
+        opened_at: str | None = None,
     ) -> Dict[str, Any]:
+        opened = opened_at or datetime.now(timezone.utc).isoformat()
         rec = {
             "trade_id": str(uuid.uuid4()),
-            "opened_at": datetime.now(timezone.utc).isoformat(),
+            "opened_at": opened,
             "symbol": symbol.upper(),
             "side": side.upper(),
             "quantity": int(quantity),
@@ -183,7 +185,13 @@ class TradeJournal:
             updated["status"] = "open"
         return self._append_trade_event(updated)
 
-    def close_trade(self, trade_id: str, exit_price: float, notes: str = "") -> Dict[str, Any]:
+    def close_trade(
+        self,
+        trade_id: str,
+        exit_price: float,
+        notes: str = "",
+        closed_at: str | None = None,
+    ) -> Dict[str, Any]:
         target = self._latest_trade_state(trade_id)
         if not target:
             raise ValueError(f"Trade {trade_id} not found")
@@ -203,12 +211,31 @@ class TradeJournal:
         closed = {
             **target,
             "status": "closed",
-            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "closed_at": closed_at or datetime.now(timezone.utc).isoformat(),
             "exit_price": float(exit_price),
             "pnl": pnl,
             "notes": notes,
         }
         return self._append_trade_event(closed)
+
+    def backfill_trade_times(
+        self,
+        trade_id: str,
+        opened_at: str | None = None,
+        closed_at: str | None = None,
+    ) -> Dict[str, Any]:
+        current = self._latest_trade_state(trade_id)
+        if not current:
+            raise ValueError(f"Trade {trade_id} not found")
+        updated = {
+            **current,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if opened_at:
+            updated["opened_at"] = opened_at
+        if closed_at and str(updated.get("status") or "").lower() == "closed":
+            updated["closed_at"] = closed_at
+        return self._append_trade_event(updated)
 
     def trades(self) -> List[Dict[str, Any]]:
         events = _read_jsonl(TRADES_FILE)
