@@ -237,6 +237,17 @@ class TradeJournal:
             updated["closed_at"] = closed_at
         return self._append_trade_event(updated)
 
+    def overwrite_trade(self, trade_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        current = self._latest_trade_state(trade_id)
+        if not current:
+            raise ValueError(f"Trade {trade_id} not found")
+        updated = {
+            **current,
+            **updates,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return self._append_trade_event(updated)
+
     def trades(self) -> List[Dict[str, Any]]:
         events = _read_jsonl(TRADES_FILE)
         latest: Dict[str, Dict[str, Any]] = {}
