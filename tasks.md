@@ -63,6 +63,11 @@ Legend:
 - [x] Muted extended-hours bars + RTH distinction.
 - [x] Bollinger + VWAP overlays.
 - [x] Candle hover interpretation context.
+- [x] Candlestick pattern interpretation panel below chart:
+  - [x] pattern classification,
+  - [x] bias + confidence,
+  - [x] interpretation + recommendation,
+  - [x] recent-candle context list.
 - [x] Structural signal computation for technical signal list.
 - [x] Remove chart text overlays for structure signals.
 - [x] Fix chart top text overlap.
@@ -72,6 +77,9 @@ Legend:
 - [x] Schwab-first quote endpoint with fallback.
 - [x] Schwab streaming quote integration (level-one stream) with REST fallback.
 - [x] Background Schwab stream service for level-one quotes + level-two book data.
+- [x] Stream API compatibility handling (`nyse_book_*` vs `listed_book_*`).
+- [x] Stream reconnect-noise suppression for benign `SUBS command succeeded` responses.
+- [x] Stream shutdown/reload websocket cleanup hardening.
 - [x] Stream-aware microstructure context wired into technical indicators (OFI/VPIN/aggressor when available).
 - [x] Stream diagnostics panel in UI (state, message age, tracked symbols, last error).
 - [x] Manual stream reconnect action in UI (`Reconnect Stream`) + backend restart endpoint.
@@ -80,10 +88,15 @@ Legend:
 - [x] Broker outcome logging in order ledger (`broker_order_id`, `broker_status`, `broker_error`).
 - [x] Broker history import on sync:
   - [x] ingest recent Schwab filled/executed orders,
+  - [x] include valid partial fills from replacement/cancel chains,
+  - [x] flatten/import nested child-order fills (e.g., bracket exits),
+  - [x] LIFO entry/exit matching by symbol,
+  - [x] correction path for previously imported mismatched broker trades,
   - [x] backfill order records,
   - [x] derive closed trades from matched entry/exit fills.
 - [x] Trade close endpoint.
 - [x] Journal and performance APIs + UI.
+- [x] Journal table explicitly sorted most-recent-first in frontend.
 
 ## Cleanup
 - [x] Removed legacy experimental `.ipynb` notebooks from repository.

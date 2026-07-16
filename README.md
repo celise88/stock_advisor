@@ -48,6 +48,11 @@ Stock Advisor is a FastAPI + Plotly application for beginner day traders, combin
 - Pre/post-market bars muted.
 - Bollinger + VWAP overlays.
 - Candle hover interpretation details.
+- Dedicated "Candlestick Pattern Read" section below the chart with:
+  - detected pattern name,
+  - bullish/bearish/neutral bias + confidence,
+  - plain-language interpretation,
+  - recommendation based on the most recent candles.
 - Structural signals shown in technical signal list.
 - Days-back is clipped to trading sessions (`days=1` => one session).
 
@@ -56,14 +61,19 @@ Stock Advisor is a FastAPI + Plotly application for beginner day traders, combin
 - Background Schwab stream service subscribes to level-one quotes + level-two book depth.
 - Stream diagnostics panel includes connection state, message age, tracked symbols, and last error.
 - Manual `Reconnect Stream` action is available from the diagnostics panel.
+- Stream subscription handling is compatible across Schwab API variants (`nyse_book_*` and `listed_book_*`) and suppresses benign `SUBS command succeeded` response noise.
+- Stream shutdown/reload path now performs explicit websocket cleanup to reduce pending-task warnings on restarts.
 - Order submission endpoint (market/limit + optional stop-loss/take-profit).
 - Dry-run support.
 - Broker sync endpoint for pending order reconciliation.
 - Broker history import during sync:
   - fetches recent Schwab filled/executed orders,
+  - includes valid partial fills from replacement/cancel chains when `filledQuantity > 0`,
+  - flattens nested Schwab child-order strategies so bracket exits are imported,
   - backfills broker order records,
-  - creates closed journal trades from matched entry/exit fills.
+  - creates/updates closed journal trades from matched entry/exit fills using symbol-level LIFO matching.
 - Trade journal + performance summaries.
+- Journal table rendering is explicitly sorted from most recent to least recent.
 - `orders.jsonl` logs both:
   - order attempts,
   - linked broker outcomes (`broker_order_id`, `broker_status`, `broker_error`).
@@ -86,6 +96,20 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 ```bash
 python init_schwab_token.py
 ```
+
+## Recent Changes
+### 2026-07-16 · v0.1.0-dev
+- **[Charting]** Added chart-side **Candlestick Pattern Read** with pattern, bias/confidence, interpretation, recommendation, and recent-candle context.
+- **[Streaming]** Hardened Schwab stream runtime:
+  - compatible exchange-book subscription handling across SDK variants,
+  - benign `SUBS command succeeded` response suppression,
+  - cleaner websocket shutdown/restart behavior.
+- **[Broker Sync]** Improved journal correctness:
+  - child-order (bracket) fill flattening for import,
+  - partial-fill handling from replace/cancel chains,
+  - LIFO lot matching for broker-history trade pairing,
+  - correction path for previously mismatched imported trades.
+- **[UI]** Journal table rendering explicitly sorted from most recent to least recent.
 
 ## Notes
 - Free-tier APIs can rate-limit and return partial fields.

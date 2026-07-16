@@ -89,6 +89,11 @@ Chart requirements:
 - pre/post-market bars visually muted,
 - Bollinger + VWAP overlays,
 - candle hover text with candle type, interpretation, and action.
+- candlestick interpretation panel below the chart that returns:
+  - pattern classification,
+  - directional bias + confidence,
+  - plain-language interpretation,
+  - recommendation based on recent candle sequence and context.
 
 Windowing requirement:
 - `days=N` means last `N` trading sessions (not a rolling `N*24h` time slice).
@@ -104,6 +109,8 @@ Quote:
 - Stream diagnostics support:
   - connection/error visibility in UI,
   - manual stream restart endpoint/action.
+- Stream service must tolerate Schwab API method variants (`nyse_book_*` vs `listed_book_*`).
+- Stream service must suppress benign subscription response frames that otherwise appear as non-fatal errors.
 
 Trading:
 - market/limit order submission with optional stop-loss / take-profit.
@@ -115,8 +122,11 @@ Lifecycle + journal:
 - pending order sync/reconciliation to filled/canceled states,
 - broker history import on sync:
   - fetch recent filled/executed Schwab orders,
+  - include valid partial fills from replace/cancel chains when filled quantity is present,
+  - include nested child-order fills (e.g., bracket exit child orders),
   - record broker order events,
-  - derive closed trades by matching entry/exit fills (FIFO by symbol),
+  - derive/update closed trades by matching entry/exit fills (LIFO by symbol),
+  - correct previously imported broker trades when newer matching evidence is available,
 - manual trade close endpoint,
 - journal + performance endpoints/cards.
 
@@ -137,6 +147,7 @@ Lifecycle + journal:
 - Graceful degradation when a data source fails.
 - Explicit warning/error messaging instead of silent failures.
 - API responses remain usable when partial data is available.
+- Stream worker shutdown/restart should close sockets cleanly to avoid orphan websocket tasks on reload.
 - Educational interpretation is informational; user confirms trade actions.
 
 ## 6) Out of Scope
