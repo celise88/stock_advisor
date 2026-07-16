@@ -24,12 +24,20 @@ Stock Advisor is a FastAPI + Plotly application for beginner day traders, combin
 
 ### Symbol Workspace - Technicals
 - Indicator cards with beginner-focused interpretation.
+- Advanced flow/context cards with clear trade guidance:
+  - Order Flow Imbalance (OFI, Cont-Kukanov-Stoikov style proxy),
+  - VPIN (volume-synchronized informed-flow proxy),
+  - tick-rule aggressor imbalance,
+  - opening/closing auction pressure proxies,
+  - cross-asset premarket leadership (ES/NQ + sector ETF),
+  - options-derived proxies (GEX, put/call skew, unusual sweep-like flow).
 - Holistic interpretation rows:
   - `Action Bias` (with `Risk Mode`),
   - `Holistic Read`,
   - `Regime Filter (ADX)`.
 - Holistic output integrates:
   - trend/momentum alignment,
+  - advanced flow/options/cross-asset context,
   - conflict detection,
   - session/day performance context,
   - relative-volume conviction adjustments.
@@ -44,7 +52,10 @@ Stock Advisor is a FastAPI + Plotly application for beginner day traders, combin
 - Days-back is clipped to trading sessions (`days=1` => one session).
 
 ### Quote, Trading, Journal
-- Schwab-first quote endpoint with fallback behavior.
+- Schwab streaming level-one quote integration (when available), with REST fallback.
+- Background Schwab stream service subscribes to level-one quotes + level-two book depth.
+- Stream diagnostics panel includes connection state, message age, tracked symbols, and last error.
+- Manual `Reconnect Stream` action is available from the diagnostics panel.
 - Order submission endpoint (market/limit + optional stop-loss/take-profit).
 - Dry-run support.
 - Broker sync endpoint for pending order reconciliation.

@@ -53,7 +53,8 @@ Maintain a production-minded MVP for beginner day traders with:
 - Top-of-chart text overlap fix (title removed, legend spacing adjusted).
 
 ### Phase 5 - Quote + Trading (Complete)
-- Schwab-first quote path with fallback behavior.
+- Schwab streaming-first quote path (level-one stream) with REST fallback behavior.
+- Background Schwab stream service for level-one quotes and level-two book depth.
 - Order submission endpoints (market/limit + optional stop-loss/take-profit).
 - Dry-run simulation flow.
 
@@ -72,9 +73,16 @@ Maintain a production-minded MVP for beginner day traders with:
 - SSL/degraded-source handling hardening.
 - Cross-provider intraday fallback and consistency improvements.
 - UI clarity improvements for scanner and technical interpretation.
+- Added advanced flow/context technical cards with actionable guidance:
+  - OFI, VPIN, aggressor imbalance, open/close auction pressure proxies,
+  - cross-asset leadership (ES/NQ + sector ETF premarket),
+  - options-derived proxies (GEX, skew, unusual flow).
+- Holistic interpretation now incorporates advanced flow/cross-asset/options context.
+- Added stream diagnostics + manual reconnect control in the UI.
 
 ## Current Build Notes
 - Scanner and technical interpretation are tuned for educational readability first.
 - External API quality/rate limits can still affect freshness/completeness.
 - Schwab integration requires valid local token setup and account permissions.
+- Schwab stream connectivity/entitlements can vary by account and exchange agreements.
 - Journal/performance reflects app-submitted trades and broker-history imports after `/api/trades/sync`.

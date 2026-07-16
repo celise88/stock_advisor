@@ -59,6 +59,13 @@ Data notes:
 Compute and display:
 - SMA, EMA, MACD, RSI, Bollinger, Stochastic, ADL, Chaikin, PSAR proxy, VWMA, ADX, VWAP,
 - Fibonacci (0.382 and 0.618) with dynamic context.
+- Advanced contextual indicators:
+  - OFI (Cont-Kukanov-Stoikov style proxy),
+  - VPIN (volume-synchronized informed-flow proxy),
+  - trade-flow aggressor imbalance via tick-rule signing,
+  - opening/closing auction imbalance proxies,
+  - cross-asset leadership using ES/NQ premarket and sector ETF premarket context,
+  - options-derived proxies (GEX, put/call skew, unusual sweep-like flow from chain activity).
 
 Interpretation requirements:
 - Indicator-by-indicator interpretation + explanation.
@@ -68,6 +75,8 @@ Interpretation requirements:
   - `Regime Filter (ADX)` guidance.
 - Holistic text integrates:
   - indicator alignment,
+  - advanced flow context (OFI, VPIN, aggressor/auction),
+  - cross-asset leadership and options context when available,
   - regime type,
   - conflict detection,
   - session/day performance context,
@@ -90,7 +99,11 @@ Signal display requirement:
 
 ### 3.5 Quote, Trading, Journal, Performance
 Quote:
-- Schwab-first real-time quote endpoint with fallback behavior.
+- Schwab streaming-first real-time quote endpoint when stream is available.
+- Graceful fallback to REST quote behavior when stream is unavailable.
+- Stream diagnostics support:
+  - connection/error visibility in UI,
+  - manual stream restart endpoint/action.
 
 Trading:
 - market/limit order submission with optional stop-loss / take-profit.
@@ -117,6 +130,7 @@ Lifecycle + journal:
   - journal/performance.
 - Static frontend (`index.html`, `app.js`, `styles.css`) served by FastAPI.
 - In-process background scanner loop.
+- In-process background Schwab stream loop for level-one quotes and level-two book data.
 - JSONL persistence in `data/`.
 
 ## 5) Reliability and Guardrails

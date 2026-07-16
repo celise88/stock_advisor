@@ -39,6 +39,13 @@ Legend:
 ## Technicals + Interpretation
 - [x] Technical indicator engine implementation.
 - [x] Per-indicator plain-language interpretation.
+- [x] Advanced flow/context indicators with actionable interpretation:
+  - [x] OFI proxy (Cont-Kukanov-Stoikov style),
+  - [x] VPIN proxy (volume-synchronized informed-flow risk),
+  - [x] tick-rule aggressor imbalance,
+  - [x] opening/closing auction pressure proxies,
+  - [x] cross-asset leadership (ES/NQ + sector ETF premarket context),
+  - [x] options-derived proxies (GEX, put/call skew, unusual sweep-like flow).
 - [x] Dynamic Fibonacci interpretation based on trend and level position.
 - [x] Holistic interpretation layer:
   - [x] Action Bias summary line,
@@ -48,7 +55,8 @@ Legend:
 - [x] Context integration:
   - [x] session/day performance impact,
   - [x] relative-volume-based conviction adjustment,
-  - [x] conflict detection text.
+  - [x] conflict detection text,
+  - [x] advanced flow/cross-asset/options integration in `Holistic Read`.
 
 ## Charting
 - [x] 5m/15m intraday chart with days-back control.
@@ -62,6 +70,11 @@ Legend:
 
 ## Quotes + Trading + Journal
 - [x] Schwab-first quote endpoint with fallback.
+- [x] Schwab streaming quote integration (level-one stream) with REST fallback.
+- [x] Background Schwab stream service for level-one quotes + level-two book data.
+- [x] Stream-aware microstructure context wired into technical indicators (OFI/VPIN/aggressor when available).
+- [x] Stream diagnostics panel in UI (state, message age, tracked symbols, last error).
+- [x] Manual stream reconnect action in UI (`Reconnect Stream`) + backend restart endpoint.
 - [x] Order placement endpoint and dry-run path.
 - [x] Pending-order sync/reconciliation endpoint.
 - [x] Broker outcome logging in order ledger (`broker_order_id`, `broker_status`, `broker_error`).
