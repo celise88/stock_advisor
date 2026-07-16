@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Stock Advisor</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260715b" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260716a" />
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   </head>
   <body>
@@ -121,6 +121,13 @@
           <h2>Intraday Chart (Pre/Post Muted)</h2>
         </div>
         <div id="chart" class="chart"></div>
+        <div id="candlestick-read" class="candlestick-read-box">
+          <h3>Candlestick Pattern Read</h3>
+          <div id="candlestick-read-summary" class="cards"></div>
+          <div id="candlestick-read-interpretation" class="info-box">No candlestick interpretation yet.</div>
+          <div id="candlestick-read-recommendation" class="info-box">Recommendation will appear after chart load.</div>
+          <ul id="candlestick-read-recent" class="candlestick-recent-list"></ul>
+        </div>
       </section>
 
       <section class="panel trade-panel">
@@ -185,6 +192,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260715b"></script>
+    <script src="/static/app.js?v=20260716a"></script>
   </body>
 </html>

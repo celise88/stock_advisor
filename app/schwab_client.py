@@ -454,13 +454,45 @@ class SchwabClient:
         if resp.status_code != 200:
             raise RuntimeError(f"Order history fetch failed: HTTP {resp.status_code} {resp.text}")
         payload = resp.json()
+        raw_orders: List[Dict[str, Any]]
         if isinstance(payload, list):
-            return [item for item in payload if isinstance(item, dict)]
-        if isinstance(payload, dict):
+            raw_orders = [item for item in payload if isinstance(item, dict)]
+        elif isinstance(payload, dict):
             orders = payload.get("orders")
             if isinstance(orders, list):
-                return [item for item in orders if isinstance(item, dict)]
-        return []
+                raw_orders = [item for item in orders if isinstance(item, dict)]
+            else:
+                raw_orders = []
+        else:
+            raw_orders = []
+
+        flattened: List[Dict[str, Any]] = []
+
+        def _walk(order: Dict[str, Any]) -> None:
+            flattened.append(order)
+            children = order.get("childOrderStrategies")
+            if isinstance(children, list):
+                for child in children:
+                    if isinstance(child, dict):
+                        _walk(child)
+
+        for order in raw_orders:
+            _walk(order)
+
+        deduped: Dict[str, Dict[str, Any]] = {}
+        extras: List[Dict[str, Any]] = []
+        for order in flattened:
+            order_id = order.get("orderId") or order.get("id")
+            if order_id is None:
+                extras.append(order)
+                continue
+            key = str(order_id)
+            existing = deduped.get(key)
+            # Prefer the richer payload when duplicates exist.
+            if existing is None or len(order.keys()) >= len(existing.keys()):
+                deduped[key] = order
+
+        return list(deduped.values()) + extras
 
     @staticmethod
     def summarize_order(order_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -480,16 +512,23 @@ class SchwabClient:
                 for leg in legs:
                     price = leg.get("price")
                     quantity = leg.get("quantity")
-                    if isinstance(price, (int, float)):
-                        prices.append(float(price))
-                    if isinstance(quantity, (int, float)):
-                        quantities.append(float(quantity))
+                    if not isinstance(price, (int, float)) or float(price) <= 0:
+                        continue
+                    qty_value = float(quantity) if isinstance(quantity, (int, float)) and float(quantity) > 0 else None
+                    prices.append(float(price))
+                    if qty_value is not None:
+                        quantities.append(qty_value)
                 if prices:
                     if quantities and len(quantities) == len(prices) and sum(quantities) > 0:
                         average_fill_price = sum(p * q for p, q in zip(prices, quantities)) / sum(quantities)
                     else:
                         average_fill_price = sum(prices) / len(prices)
                     break
+
+        if average_fill_price is None:
+            order_price = order_payload.get("price")
+            if isinstance(order_price, (int, float)) and float(order_price) > 0:
+                average_fill_price = float(order_price)
 
         symbol = None
         side = None

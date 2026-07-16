@@ -201,6 +201,36 @@ th {
   min-height: 620px;
 }
 
+.candlestick-read-box {
+  margin-top: 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.candlestick-read-box h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.candlestick-reco.bullish {
+  border-color: rgba(20, 184, 166, 0.55);
+  color: #99f6e4;
+}
+
+.candlestick-reco.bearish {
+  border-color: rgba(239, 68, 68, 0.55);
+  color: #fecaca;
+}
+
+.candlestick-reco.neutral {
+  border-color: rgba(148, 163, 184, 0.55);
+}
+
+.candlestick-recent-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
 .quote-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));

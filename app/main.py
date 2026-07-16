@@ -114,13 +114,16 @@ def _parse_filled_events(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         summary = SchwabClient.summarize_order(order)
         status = str(summary.get("status") or "").upper()
-        if status not in {"FILLED", "EXECUTED"}:
-            continue
         symbol = summary.get("symbol")
         side = summary.get("side")
         fill_price = _safe_float(summary.get("averageFillPrice"))
-        qty = _safe_float(summary.get("filledQuantity")) or _safe_float(summary.get("quantity"))
+        filled_qty = _safe_float(summary.get("filledQuantity"))
+        qty = filled_qty if filled_qty is not None and filled_qty > 0 else _safe_float(summary.get("quantity"))
         order_id = _order_id(order)
+        has_confirmed_fill = status in {"FILLED", "EXECUTED"}
+        has_partial_fill = status not in {"FILLED", "EXECUTED"} and filled_qty is not None and filled_qty > 0
+        if not (has_confirmed_fill or has_partial_fill):
+            continue
         if not symbol or side not in {"BUY", "SELL"} or fill_price is None or qty is None or qty <= 0 or not order_id:
             continue
         events.append(
@@ -154,6 +157,8 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
     existing_trades = journal.trades()
     existing_trade_keys = set()
     existing_trade_by_key: Dict[str, Dict[str, Any]] = {}
+    existing_trade_key_by_id: Dict[str, str] = {}
+    existing_trade_by_exit_id: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     existing_trade_broker_ids = set()
     for trade in existing_trades:
         notes = str(trade.get("notes") or "")
@@ -162,9 +167,15 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
             import_key = notes.split(marker, 1)[1].split(";", 1)[0].strip()
             existing_trade_keys.add(import_key)
             existing_trade_by_key[import_key] = trade
+            trade_id = str(trade.get("trade_id") or "")
+            if trade_id:
+                existing_trade_key_by_id[trade_id] = import_key
         exit_marker = "exit_order_id="
         if exit_marker in notes:
-            existing_trade_broker_ids.add(notes.split(exit_marker, 1)[1].split(";", 1)[0].strip())
+            exit_order_id = notes.split(exit_marker, 1)[1].split(";", 1)[0].strip()
+            existing_trade_broker_ids.add(exit_order_id)
+            if exit_order_id:
+                existing_trade_by_exit_id[exit_order_id].append(trade)
         broker_id = trade.get("broker_order_id")
         if broker_id:
             existing_trade_broker_ids.add(str(broker_id))
@@ -197,7 +208,7 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         logged_orders += 1
 
     # Ignore fills already tied to existing tracked trades to avoid duplicates.
-    importable_events = [e for e in events if e["order_id"] not in existing_trade_broker_ids]
+    importable_events = list(events)
 
     long_lots: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     short_lots: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -213,7 +224,9 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         remaining = qty_to_match
         lots = entry_lots[symbol]
         while remaining > 0 and lots:
-            lot = lots[0]
+            # Match newest lots first (LIFO) to better align with intraday
+            # round-trip behavior when users carry older swing inventory.
+            lot = lots[-1]
             matched_qty = min(remaining, lot["qty_remaining"])
             lot["qty_remaining"] -= matched_qty
             remaining -= matched_qty
@@ -235,7 +248,7 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
             )
 
             if lot["qty_remaining"] <= 1e-9:
-                lots.pop(0)
+                lots.pop()
         return remaining
 
     for event in importable_events:
@@ -268,6 +281,7 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
     imported_closed = 0
     skipped_existing = 0
     backfilled_timestamps = 0
+    correctedClosedTrades = 0
 
     def _to_iso(value: Any) -> Optional[str]:
         if isinstance(value, datetime):
@@ -300,6 +314,66 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
                     )
                     backfilled_timestamps += 1
             skipped_existing += 1
+            continue
+
+        # If an existing imported closed trade used the same exit order/qty but
+        # was previously paired to a different entry lot, overwrite it.
+        corrected = False
+        for existing in existing_trade_by_exit_id.get(str(match["exit_order_id"]), []):
+            if str(existing.get("strategy") or "") != "broker_import":
+                continue
+            if str(existing.get("status") or "").lower() != "closed":
+                continue
+            if int(round(float(existing.get("quantity") or 0))) != qty_int:
+                continue
+            trade_id = str(existing.get("trade_id") or "")
+            if not trade_id:
+                continue
+            side = str(match["entry_side"]).upper()
+            pnl_mult = 1.0 if side == "BUY" else -1.0
+            pnl = (float(match["exit_price"]) - float(match["entry_price"])) * float(qty_int) * pnl_mult
+            journal.overwrite_trade(
+                trade_id=trade_id,
+                updates={
+                    "opened_at": entry_iso or existing.get("opened_at"),
+                    "closed_at": exit_iso or existing.get("closed_at"),
+                    "symbol": match["symbol"],
+                    "side": side,
+                    "quantity": qty_int,
+                    "entry_price": float(match["entry_price"]),
+                    "exit_price": float(match["exit_price"]),
+                    "pnl": pnl,
+                    "strategy": "broker_import",
+                    "status": "closed",
+                    "order_id": f"broker_import:{import_key}",
+                    "broker_order_id": match["entry_order_id"],
+                    "broker_status": "FILLED",
+                    "notes": (
+                        f"Imported from Schwab fills; "
+                        f"broker_import_key={import_key}; "
+                        f"exit_order_id={match['exit_order_id']}"
+                    ),
+                },
+            )
+            old_key = existing_trade_key_by_id.get(trade_id)
+            if old_key:
+                existing_trade_keys.discard(old_key)
+                existing_trade_by_key.pop(old_key, None)
+            existing_trade_keys.add(import_key)
+            existing_trade_key_by_id[trade_id] = import_key
+            existing_trade_by_key[import_key] = {
+                **existing,
+                "order_id": f"broker_import:{import_key}",
+                "quantity": qty_int,
+                "entry_price": float(match["entry_price"]),
+                "exit_price": float(match["exit_price"]),
+                "opened_at": entry_iso or existing.get("opened_at"),
+                "closed_at": exit_iso or existing.get("closed_at"),
+            }
+            correctedClosedTrades += 1
+            corrected = True
+            break
+        if corrected:
             continue
 
         opened = journal.log_open_trade(
@@ -343,6 +417,7 @@ def _import_broker_history(orders: List[Dict[str, Any]]) -> Dict[str, Any]:
         "fetchedFilledOrders": len(events),
         "loggedOrders": logged_orders,
         "importedClosedTrades": imported_closed,
+        "correctedClosedTrades": correctedClosedTrades,
         "skippedExistingTrades": skipped_existing,
         "backfilledTradeTimestamps": backfilled_timestamps,
         "openUnmatchedLots": unmatched,

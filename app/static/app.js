@@ -118,6 +118,52 @@ function renderCards(containerId, rows) {
   }
 }
 
+function renderCandlestickRead(read) {
+  const summary = document.getElementById("candlestick-read-summary");
+  const interpretation = document.getElementById("candlestick-read-interpretation");
+  const recommendation = document.getElementById("candlestick-read-recommendation");
+  const recent = document.getElementById("candlestick-read-recent");
+  if (!summary || !interpretation || !recommendation || !recent) return;
+
+  if (!read) {
+    summary.innerHTML = "";
+    interpretation.textContent = "No candlestick interpretation available for this chart.";
+    recommendation.textContent = "Recommendation unavailable.";
+    recommendation.className = "info-box candlestick-reco neutral";
+    recent.innerHTML = "<li>Recent candle details unavailable.</li>";
+    return;
+  }
+
+  const pattern = read.pattern || "Unclassified";
+  const bias = String(read.bias || "neutral").toLowerCase();
+  const confidence = String(read.confidence || "low");
+
+  renderCards("candlestick-read-summary", [
+    { label: "Pattern", value: pattern },
+    { label: "Bias", value: bias.toUpperCase() },
+    { label: "Confidence", value: confidence.toUpperCase() },
+  ]);
+
+  interpretation.textContent = read.interpretation || "No pattern interpretation available.";
+  recommendation.textContent = `Recommendation: ${read.recommendation || "Wait for clearer confirmation."}`;
+  recommendation.className = `info-box candlestick-reco ${bias}`;
+
+  recent.innerHTML = "";
+  const rows = Array.isArray(read.recentCandles) ? read.recentCandles : [];
+  if (!rows.length) {
+    recent.innerHTML = "<li>Recent candle details unavailable.</li>";
+    return;
+  }
+  for (const c of rows) {
+    const li = document.createElement("li");
+    const time = fmtIsoDateTime(c.timestamp);
+    const close = fmtNumber(c.close);
+    const delta = isValidNumber(c.changeFromOpenPct) ? fmtSigned(c.changeFromOpenPct) : "—";
+    li.textContent = `${time}: ${c.candleType || "Candle"} | Close ${close} | Δ from open ${delta}%`;
+    recent.appendChild(li);
+  }
+}
+
 function renderActionBias(actionIndicator) {
   const el = document.getElementById("technicals-action-bias");
   if (!el) return;
@@ -410,6 +456,7 @@ async function loadChart() {
   const figure = payload.figure || {};
   Plotly.newPlot("chart", figure.data || [], figure.layout || {}, { responsive: true });
   state.chartHasCandles = Boolean(payload.candles && payload.candles.length > 0);
+  renderCandlestickRead(payload.candlestickRead || null);
   return payload;
 }
 
@@ -488,16 +535,27 @@ async function loadJournal() {
 
   const tbody = document.querySelector("#trades-table tbody");
   tbody.innerHTML = "";
-  for (const t of (journal.trades || []).slice().reverse().slice(0, 100)) {
+
+  const tradeDisplayTime = (trade) =>
+    (trade.status === "closed" ? (trade.closed_at || null) : null) ||
+    trade.updated_at ||
+    trade.opened_at ||
+    null;
+
+  const sortedTrades = (journal.trades || []).slice().sort((a, b) => {
+    const aMs = Date.parse(tradeDisplayTime(a) || "");
+    const bMs = Date.parse(tradeDisplayTime(b) || "");
+    const aSafe = Number.isFinite(aMs) ? aMs : Number.NEGATIVE_INFINITY;
+    const bSafe = Number.isFinite(bMs) ? bMs : Number.NEGATIVE_INFINITY;
+    return bSafe - aSafe;
+  });
+
+  for (const t of sortedTrades.slice(0, 100)) {
     const tr = document.createElement("tr");
     const closeBtn = t.status === "open"
       ? `<button class="close-trade-btn" data-trade-id="${t.trade_id}">Close</button>`
       : "";
-    const rowDateTime =
-      (t.status === "closed" ? (t.closed_at || null) : null) ||
-      t.updated_at ||
-      t.opened_at ||
-      null;
+    const rowDateTime = tradeDisplayTime(t);
     tr.innerHTML = `
       <td>${t.trade_id || ""}</td>
       <td>${fmtIsoDateTime(rowDateTime)}</td>

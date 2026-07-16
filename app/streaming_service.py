@@ -31,6 +31,7 @@ class SchwabStreamService:
 
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._stream: Optional[Any] = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
@@ -95,10 +96,24 @@ class SchwabStreamService:
     def stop(self) -> None:
         self._stop_event.set()
         loop = self._loop
+        with self._lock:
+            stream = self._stream
         if loop and loop.is_running():
+            if stream is not None:
+                try:
+                    close_future = asyncio.run_coroutine_threadsafe(self._close_stream_socket(stream), loop)
+                    close_future.result(timeout=2.5)
+                except Exception:
+                    pass
             loop.call_soon_threadsafe(lambda: None)
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=5.0)
+        with self._lock:
+            self._connected = False
+            self._loop = None
+            self._stream = None
+        if self._thread and not self._thread.is_alive():
+            self._thread = None
 
     def restart(self) -> Dict[str, Any]:
         """Restart the stream worker and resubscribe existing symbols."""
@@ -216,6 +231,8 @@ class SchwabStreamService:
                 await self._connect_and_stream()
                 backoff_sec = 2.0
             except Exception as exc:
+                if self._stop_event.is_set():
+                    break
                 msg = str(exc)
                 with self._lock:
                     self._connected = False
@@ -224,6 +241,13 @@ class SchwabStreamService:
                     backoff_sec = max(backoff_sec, 30.0)
                 await asyncio.sleep(backoff_sec)
                 backoff_sec = min(backoff_sec * 1.5, 60.0)
+
+    @staticmethod
+    def _is_benign_stream_response_error(exc: Exception) -> bool:
+        text = str(exc).upper()
+        if "UNEXPECTED RESPONSE CODE DURING MESSAGE HANDLING: 0" not in text:
+            return False
+        return ("SUBS COMMAND SUCCEEDED" in text) or ("UNSUBS COMMAND SUCCEEDED" in text)
 
     async def _connect_and_stream(self) -> None:
         try:
@@ -244,33 +268,68 @@ class SchwabStreamService:
 
         account_id = SETTINGS.schwab_account_id or None
         stream = StreamClient(sdk_client, account_id=account_id)
-        self._loop = asyncio.get_running_loop()
-
-        await stream.login()
-        stream.add_level_one_equity_handler(self._handle_level_one_message)
-        stream.add_nasdaq_book_handler(self._handle_book_message)
-        stream.add_nyse_book_handler(self._handle_book_message)
-
-        with self._lock:
-            self._connected = True
-            self._last_error = None
-
-        await self._subscribe_pending_symbols(stream, full_subscribe=True)
-
         try:
+            self._loop = asyncio.get_running_loop()
+            with self._lock:
+                self._stream = stream
+
+            await stream.login()
+            stream.add_level_one_equity_handler(self._handle_level_one_message)
+            stream.add_nasdaq_book_handler(self._handle_book_message)
+            nyse_handler = getattr(stream, "add_nyse_book_handler", None)
+            listed_handler = getattr(stream, "add_listed_book_handler", None)
+            if callable(nyse_handler):
+                nyse_handler(self._handle_book_message)
+            elif callable(listed_handler):
+                listed_handler(self._handle_book_message)
+
+            with self._lock:
+                self._connected = True
+                self._last_error = None
+
+            await self._subscribe_pending_symbols(stream, full_subscribe=True)
+
             while not self._stop_event.is_set():
                 await self._subscribe_pending_symbols(stream, full_subscribe=False)
                 try:
                     await asyncio.wait_for(stream.handle_message(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
+                except Exception as exc:
+                    if self._is_benign_stream_response_error(exc):
+                        continue
+                    raise
         finally:
             with self._lock:
                 self._connected = False
+            await self._close_stream_socket(stream)
+            with self._lock:
+                if self._stream is stream:
+                    self._stream = None
+
+    async def _close_stream_socket(self, stream: Any) -> None:
+        socket = getattr(stream, "_socket", None)
+        if socket is None:
+            return
+
+        close_method = getattr(socket, "close", None)
+        if callable(close_method):
             try:
-                await stream.logout()
+                await close_method()
             except Exception:
                 pass
+
+        wait_closed = getattr(socket, "wait_closed", None)
+        if callable(wait_closed):
+            try:
+                await asyncio.wait_for(wait_closed(), timeout=2.0)
+            except Exception:
+                pass
+
+        try:
+            stream._socket = None
+        except Exception:
+            pass
 
     async def _subscribe_pending_symbols(self, stream: Any, full_subscribe: bool) -> None:
         with self._lock:
@@ -285,27 +344,39 @@ class SchwabStreamService:
         if not symbols:
             return
 
+        level_sub = getattr(stream, "level_one_equity_subs", None)
+        level_add = getattr(stream, "level_one_equity_add", None)
+        nasdaq_sub = getattr(stream, "nasdaq_book_subs", None)
+        nasdaq_add = getattr(stream, "nasdaq_book_add", None)
+        nyse_sub = getattr(stream, "nyse_book_subs", None)
+        nyse_add = getattr(stream, "nyse_book_add", None)
+        listed_sub = getattr(stream, "listed_book_subs", None)
+        listed_add = getattr(stream, "listed_book_add", None)
+
+        secondary_book_sub = nyse_sub if callable(nyse_sub) else (listed_sub if callable(listed_sub) else None)
+        secondary_book_add = nyse_add if callable(nyse_add) else (listed_add if callable(listed_add) else None)
+
         try:
             if full_subscribe:
-                await stream.level_one_equity_subs(symbols)
-                await stream.nasdaq_book_subs(symbols)
-                await stream.nyse_book_subs(symbols)
+                if callable(level_sub):
+                    await level_sub(symbols)
+                if callable(nasdaq_sub):
+                    await nasdaq_sub(symbols)
+                if callable(secondary_book_sub):
+                    await secondary_book_sub(symbols)
             else:
-                level_add = getattr(stream, "level_one_equity_add", None)
-                nasdaq_add = getattr(stream, "nasdaq_book_add", None)
-                nyse_add = getattr(stream, "nyse_book_add", None)
                 if callable(level_add):
                     await level_add(symbols)
-                else:
-                    await stream.level_one_equity_subs(symbols)
+                elif callable(level_sub):
+                    await level_sub(symbols)
                 if callable(nasdaq_add):
                     await nasdaq_add(symbols)
-                else:
-                    await stream.nasdaq_book_subs(symbols)
-                if callable(nyse_add):
-                    await nyse_add(symbols)
-                else:
-                    await stream.nyse_book_subs(symbols)
+                elif callable(nasdaq_sub):
+                    await nasdaq_sub(symbols)
+                if callable(secondary_book_add):
+                    await secondary_book_add(symbols)
+                elif callable(secondary_book_sub):
+                    await secondary_book_sub(symbols)
             with self._lock:
                 self._subscribed_symbols.update(symbols)
         except Exception as exc:
