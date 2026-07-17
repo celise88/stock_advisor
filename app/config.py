@@ -145,6 +145,17 @@ class Settings:
             "USB",
             "STT",
             "CFG",
+            "ONTO",
+            "MITK",
+            "STAK",
+            "VEEE",
+            "PENG",
+            "MAN",
+            "TFC",
+            "FITB",
+            "RF",
+            "ALV",
+            "BFC",
 
         ]
     )
